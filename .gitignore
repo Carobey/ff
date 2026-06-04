@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# venv
+.venv/
+venv/
+
+# uv
+.uv-cache/
+
+# Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+data/
+uploads/
+*.db
+*.sqlite
+
+# Skip docker volumes if mounted locally
+postgres_data/
+falkordb_data/
+
+#other
+.claude/
+AGENTS.md
+CLAUDE.md
