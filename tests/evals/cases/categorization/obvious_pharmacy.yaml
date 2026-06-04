@@ -1,0 +1,18 @@
+id: cat_002
+agent: categorizer
+description: "Очевидная категоризация — аптека 36.6"
+tags: [categorization, easy, baseline, prompt-v1]
+input:
+  merchant_raw: "АПТЕКА 36.6 ТЦ ЕВРОПЕЙСКИЙ"
+  amount: "890.00"
+  direction: expense
+expected:
+  category: health.pharmacy
+  confidence_min: 0.8
+scorers:
+  - type: exact_match
+    field: category
+  - type: threshold
+    field: confidence
+    op: ">="
+    value: 0.8

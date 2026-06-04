@@ -1,0 +1,20 @@
+id: cat_001
+agent: categorizer
+description: "Очевидная категоризация — продуктовый супермаркет Пятёрочка"
+tags: [categorization, easy, baseline, prompt-v1]
+input:
+  merchant_raw: "ПЯТЕРОЧКА 4587 МСК"
+  amount: "523.40"
+  direction: expense
+expected:
+  category: food.groceries
+  confidence_min: 0.8
+scorers:
+  - type: exact_match
+    field: category
+  - type: threshold
+    field: confidence
+    op: ">="
+    value: 0.8
+  - type: llm_judge
+    field: category  # LLM-judge: разумна ли предсказанная категория для мерчанта

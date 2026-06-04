@@ -1,0 +1,11 @@
+id: route_002
+agent: supervisor
+description: "Поведенческий вопрос → нода coach (Graphiti episodic retrieval)"
+tags: [tool-call, routing, coach, ru]
+input:
+  text: "когда я последний раз так тратил?"
+expected:
+  route: coach
+scorers:
+  - type: tool_call
+    field: route

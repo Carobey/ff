@@ -1,0 +1,18 @@
+id: cat_005
+agent: categorizer
+description: "АЗС — заправка Лукойл"
+tags: [categorization, easy, transport, prompt-v1]
+input:
+  merchant_raw: "LUKOIL AZS 0234 MO"
+  amount: "3120.00"
+  direction: expense
+expected:
+  category: transport.fuel
+  confidence_min: 0.8
+scorers:
+  - type: exact_match
+    field: category
+  - type: threshold
+    field: confidence
+    op: ">="
+    value: 0.8

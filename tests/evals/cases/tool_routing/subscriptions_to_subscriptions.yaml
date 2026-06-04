@@ -1,0 +1,11 @@
+id: route_003
+agent: supervisor
+description: "Запрос подписок → нода subscriptions (detect_recurring через MCP)"
+tags: [tool-call, routing, subscriptions, ru]
+input:
+  text: "покажи мои подписки"
+expected:
+  route: subscriptions
+scorers:
+  - type: tool_call
+    field: route

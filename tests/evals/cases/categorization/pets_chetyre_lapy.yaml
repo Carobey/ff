@@ -1,0 +1,18 @@
+id: cat_011
+agent: categorizer
+description: "Зоотовары — Четыре Лапы"
+tags: [categorization, easy, pets, prompt-v1]
+input:
+  merchant_raw: "CHETYRE LAPY MSK"
+  amount: "1870.00"
+  direction: expense
+expected:
+  category: pets
+  confidence_min: 0.75
+scorers:
+  - type: exact_match
+    field: category
+  - type: threshold
+    field: confidence
+    op: ">="
+    value: 0.75

@@ -1,0 +1,18 @@
+id: cat_006
+agent: categorizer
+description: "Кафе — сеть Шоколадница"
+tags: [categorization, medium, food, prompt-v1]
+input:
+  merchant_raw: "SHOKOLADNITSA TC AVIAPARK"
+  amount: "1340.00"
+  direction: expense
+expected:
+  category: food.restaurant
+  confidence_min: 0.7
+scorers:
+  - type: exact_match
+    field: category
+  - type: threshold
+    field: confidence
+    op: ">="
+    value: 0.7

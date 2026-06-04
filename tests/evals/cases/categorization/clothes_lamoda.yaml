@@ -1,0 +1,18 @@
+id: cat_009
+agent: categorizer
+description: "Одежда для взрослых — Lamoda"
+tags: [categorization, medium, shopping, prompt-v1]
+input:
+  merchant_raw: "LAMODA MOSCOW RU"
+  amount: "4590.00"
+  direction: expense
+expected:
+  category: shopping.clothes
+  confidence_min: 0.7
+scorers:
+  - type: exact_match
+    field: category
+  - type: threshold
+    field: confidence
+    op: ">="
+    value: 0.7

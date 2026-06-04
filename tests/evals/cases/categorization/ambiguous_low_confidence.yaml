@@ -1,0 +1,16 @@
+id: cat_003
+agent: categorizer
+description: "Неоднозначный продавец — ИП без названия, должен дать низкий confidence"
+tags: [categorization, hard, ambiguous, prompt-v1]
+input:
+  merchant_raw: "ИП СИДОРОВ А.В. МСК"
+  amount: "1250.00"
+  direction: expense
+expected:
+  # Мы не проверяем конкретную категорию — только что модель честна о неуверенности
+  confidence_max: 0.75
+scorers:
+  - type: threshold
+    field: confidence
+    op: "<="
+    value: 0.75
