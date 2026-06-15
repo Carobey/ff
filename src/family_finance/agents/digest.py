@@ -16,15 +16,19 @@ import uuid
 import zoneinfo
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import cast
 
 import structlog
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 
 from family_finance.agents._messages import message_text
 from family_finance.agents.advisor import build_advice_block
 from family_finance.agents.subscriptions import detect_alerts
 from family_finance.domain import Category
 from family_finance.infrastructure.llm import get_chat_model
+from family_finance.infrastructure.observability import make_callback_handler
 from family_finance.infrastructure.persistence import PostgresTransactionRepository
 
 logger = structlog.get_logger()
@@ -41,6 +45,21 @@ _DIGEST_SYSTEM = """\
 """
 
 
+def _trace_config(family_id: uuid.UUID) -> RunnableConfig:
+    """LangFuse callback для дайджеста: вызывается в обход графа (/digest +
+    плановая рассылка), поэтому callback нужно прикрепить вручную, иначе trace
+    не появится. Сессия — на семью, своя от чат-тредов ``tg:<chat_id>``."""
+    return {
+        "callbacks": cast("list[BaseCallbackHandler]", [make_callback_handler()]),
+        "metadata": {
+            "langfuse_user_id": str(family_id),
+            "langfuse_session_id": f"digest:{family_id}",
+            "langfuse_tags": ["digest", "phase2"],
+            "langfuse_trace_name": "weekly-digest",
+        },
+    }
+
+
 def _week_window(now: datetime | None = None) -> tuple[datetime, datetime]:
     """Return [start, end) for the most recently completed Mon..Sun week."""
     now = now or datetime.now(_MOSCOW)
@@ -49,9 +68,6 @@ def _week_window(now: datetime | None = None) -> tuple[datetime, datetime]:
     end_local = (now + timedelta(days=(7 - now.weekday()) % 7 or 7)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    # If "now" is exactly Monday 00:00 the formula gives end=next week — shift back.
-    if end_local > now + timedelta(days=7):
-        end_local -= timedelta(days=7)
     start_local = end_local - timedelta(days=7)
     return start_local, end_local
 
@@ -82,6 +98,7 @@ async def build_digest(family_id: uuid.UUID, *, now: datetime | None = None) -> 
         model = get_chat_model(tier="worker")
         response = await model.ainvoke(
             [SystemMessage(content=_DIGEST_SYSTEM), HumanMessage(content=facts)],
+            config=_trace_config(family_id),
         )
         narrative = message_text(response).strip()
     except Exception:

@@ -18,13 +18,11 @@ so every outbound call is masked without per-node changes.
 
 from __future__ import annotations
 
-import re
-from datetime import datetime
 from functools import lru_cache
 
 import spacy
 from langchain_core.messages import BaseMessage, HumanMessage
-from presidio_analyzer import AnalyzerEngine, RecognizerResult
+from presidio_analyzer import AnalyzerEngine
 from presidio_analyzer.nlp_engine import SpacyNlpEngine
 from presidio_analyzer.predefined_recognizers import PhoneRecognizer
 from presidio_anonymizer import AnonymizerEngine
@@ -32,7 +30,6 @@ from presidio_anonymizer.entities import OperatorConfig
 
 # Regex/context entities we strip before a cloud LLM. All detectable without NER.
 _ENTITIES = ["PHONE_NUMBER", "CREDIT_CARD", "EMAIL_ADDRESS", "IBAN_CODE", "IP_ADDRESS"]
-_DATE_RE = re.compile(r"^\d{1,2}[./-]\d{1,2}[./-]\d{4}$")
 
 # Presidio works in one language pass; the identifiers above are language-neutral
 # regexes, so we run the "en" recognizer set over the (often Russian) text.
@@ -63,12 +60,11 @@ def _engines() -> tuple[AnalyzerEngine, AnonymizerEngine]:
 
 
 def mask_text(text: str) -> str:
-    """Replace any detected PII with ``[ENTITY_TYPE]`` placeholders."""
+    """Replace any detected PII with ``<ENTITY_TYPE>`` placeholders."""
     if not text:
         return text
     analyzer, anonymizer = _engines()
     results = analyzer.analyze(text=text, entities=_ENTITIES, language=_LANG)
-    results = _drop_phone_date_false_positives(text, results)
     if not results:
         return text
     return anonymizer.anonymize(
@@ -76,32 +72,8 @@ def mask_text(text: str) -> str:
         # presidio-analyzer and -anonymizer ship distinct RecognizerResult
         # classes; they are structurally identical and the runtime accepts ours.
         analyzer_results=results,  # type: ignore[arg-type]
-        operators={
-            entity: OperatorConfig("replace", {"new_value": f"[{entity}]"})
-            for entity in _ENTITIES
-        },
+        operators={"DEFAULT": OperatorConfig("replace")},
     ).text
-
-
-def _drop_phone_date_false_positives(
-    text: str,
-    results: list[RecognizerResult],
-) -> list[RecognizerResult]:
-    return [result for result in results if not _is_phone_date_false_positive(text, result)]
-
-
-def _is_phone_date_false_positive(text: str, result: RecognizerResult) -> bool:
-    if result.entity_type != "PHONE_NUMBER":
-        return False
-    value = text[result.start : result.end].strip()
-    if not _DATE_RE.fullmatch(value):
-        return False
-    normalized = value.replace("/", ".").replace("-", ".")
-    try:
-        datetime.strptime(normalized, "%d.%m.%Y")
-    except ValueError:
-        return False
-    return True
 
 
 def mask_messages(messages: list[BaseMessage]) -> list[BaseMessage]:

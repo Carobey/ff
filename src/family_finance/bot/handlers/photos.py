@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import logging
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
+import structlog
 from aiogram import Bot, F, Router
 from aiogram.types import Message
 from langchain_core.callbacks import BaseCallbackHandler
@@ -14,12 +14,11 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
 
-from family_finance.bot.telegram_text import answer_plain
 from family_finance.infrastructure.observability import make_callback_handler
 from family_finance.infrastructure.persistence import PostgresTransactionRepository
 from family_finance.infrastructure.settings import Settings
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 router = Router(name="photos")
 
 
@@ -50,6 +49,11 @@ async def handle_photo(
 
     # Telegram sends several sizes — take the largest (last in list)
     photo = message.photo[-1]
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    if photo.file_size is not None and photo.file_size > max_bytes:
+        await message.answer(f"⛔ Фото больше {settings.max_upload_mb} МБ — не принимаю.")
+        return
+
     user_id = message.from_user.id if message.from_user else 0
     display_name = message.from_user.full_name if message.from_user else str(user_id)
 
@@ -107,4 +111,4 @@ async def handle_photo(
         return
 
     reply = result["messages"][-1].content
-    await answer_plain(message, reply)
+    await message.answer(str(reply))

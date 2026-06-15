@@ -21,7 +21,7 @@ from decimal import Decimal
 import structlog
 from langchain_core.messages import AIMessage
 
-from family_finance.agents.state import FinanceState
+from family_finance.agents.state import FinanceState, SectionResult
 from family_finance.domain import BudgetStatus, Category
 from family_finance.infrastructure.mcp import MCPLedgerReader
 
@@ -125,9 +125,43 @@ async def budgets_node(state: FinanceState) -> dict[str, object]:
     }
 
 
+# ── Orchestrator section (ADR 0008) ───────────────────────────────────────────
+
+
+async def build_budgets_section(
+    family_id: uuid.UUID,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> SectionResult:
+    """Budget status for the given period — one orchestrator-worker section.
+
+    Period передаётся явно из планировщика; если он не распарсен («за все
+    время») — падаем на текущий московский месяц, как в одиночной ноде.
+    """
+    if start is None or end is None:
+        start, end = current_moscow_month()
+    repo = MCPLedgerReader()
+    statuses = await repo.get_budget_status(
+        family_id=family_id,
+        month_start=start,
+        month_end=end,
+    )
+    return {
+        "kind": "budgets",
+        "order": 2,
+        "title": "Бюджеты",
+        "body": format_budgets(statuses),
+    }
+
+
 # ── Category parsing ──────────────────────────────────────────────────────────
 
 
+# Намеренно отдельная таблица (см. подробный комментарий в ``ledger_terms``).
+# Здесь: бюджет-ввод → ОДНА категория (1→1, без направления — оно выводится из
+# категории). «магазин» здесь = продуктовый бюджет (FOOD_GROCERIES); в
+# ``clarifications`` тот же токен ведёт в SHOPPING_GENERIC — слить нельзя.
 _RU_CATEGORY_ALIASES: dict[tuple[str, ...], Category] = {
     ("продукт", "еда", "магазин", "супермаркет"): Category.FOOD_GROCERIES,
     ("ресторан", "кафе", "столовая"): Category.FOOD_RESTAURANT,

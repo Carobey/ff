@@ -13,6 +13,7 @@ LangFuse bootstrap. Создаёт CallbackHandler для LangChain/LangGraph.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
@@ -50,6 +51,32 @@ def make_callback_handler() -> CallbackHandler:
     return CallbackHandler(
         public_key=s.langfuse_public_key.get_secret_value(),
     )
+
+
+def emit_score(
+    name: str,
+    value: float,
+    *,
+    comment: str | None = None,
+    data_type: Literal["NUMERIC", "BOOLEAN"] = "NUMERIC",
+) -> None:
+    """Прикрепить production-скор к ТЕКУЩЕМУ trace (внутри graph.ainvoke).
+
+    Используется нодами графа для бизнес-метрик дашбордов:
+    injection_blocked, categorization_review_rate и т.п.
+
+    Observability никогда не должна ронять приложение — любая ошибка
+    (нет активного trace, сеть, версия SDK) глотается с warning-логом.
+    """
+    try:
+        get_langfuse().score_current_trace(
+            name=name,
+            value=value,
+            data_type=data_type,
+            comment=comment,
+        )
+    except Exception:
+        logger.warning("langfuse_emit_score_failed name=%s", name, exc_info=True)
 
 
 def flush() -> None:

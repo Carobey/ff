@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     # === Telegram ===
     telegram_bot_token: SecretStr = SecretStr("put-your-token-here")
     telegram_allowed_user_ids: str = Field(default="")
+    # Лимит размера загружаемого файла (выписка/фото чека) — disk-fill guard на границе.
+    max_upload_mb: int = 20
+    # Dev-воркэраунд: форсировать IPv4 + публичный DNS для сессии Telegram. Нужно
+    # только в сетях, где локальный резолвер отдаёт нероутируемый IPv6 для
+    # api.telegram.org. По умолчанию выключено (в проде сеть нормальная).
+    telegram_force_ipv4_dns: bool = False
 
     @property
     def allowed_user_ids(self) -> set[int]:
@@ -71,6 +77,10 @@ class Settings(BaseSettings):
     # False (default): LLM только для UNCLASSIFIED/needs_review.
     # True: прогнать ВСЕ транзакции через LLM (дороже, точнее для демо).
     llm_categorize_all: bool = False
+
+    # Порог fuzzy-матча продавца к правилу-справочнику (pg_trgm word_similarity).
+    # ≥ порога → категория берётся из БД без LLM. Ниже → уходит в LLM.
+    merchant_match_threshold: float = 0.6
 
     # === Postgres ===
     # SecretStr: DSN содержит пароль — не должен светиться в repr(Settings)/логах.

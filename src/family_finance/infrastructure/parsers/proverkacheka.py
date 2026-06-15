@@ -8,7 +8,7 @@ Add token to .env: PROVERKACHEKA_API_TOKEN=your-token-here
 
 Flow:
   POST /api/v1/check/get
-  Form body: token=<token>&qrraw=<qr_string>
+  Body: {"token": "<token>", "qrraw": "<qr_string>"}
 
   Response (success):
     {"code": 1, "data": {"json": { <fiscal detail> }}}
@@ -19,25 +19,19 @@ Flow:
 
 from __future__ import annotations
 
-import logging
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
 
 import httpx
+import structlog
 
 from family_finance.domain.receipt import Receipt, ReceiptItem
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 _API_URL = "https://proverkacheka.com/api/v1/check/get"
 _TIMEOUT = 15.0  # seconds
-_ERROR_MESSAGES: dict[object, str] = {
-    2: "Чек не найден в ФНС",
-    4: "Нужно подождать перед повторным запросом к ProverkaCheka",
-    5: "Нет информации по чеку в ФНС (прочее)",
-    401: "ProverkaCheka не авторизовала запрос: проверь PROVERKACHEKA_API_TOKEN",
-}
 
 
 class ProverkaCheckaError(Exception):
@@ -65,7 +59,7 @@ class ProverkaCheckaClient:
         payload = {"token": self._token, "qrraw": qr_raw}
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             try:
-                resp = await client.post(_API_URL, data=payload)
+                resp = await client.post(_API_URL, json=payload)
                 resp.raise_for_status()
             except httpx.HTTPStatusError as e:
                 raise ProverkaCheckaError(
@@ -74,16 +68,12 @@ class ProverkaCheckaClient:
             except httpx.RequestError as e:
                 raise ProverkaCheckaError(f"Network error: {e}") from e
 
-        try:
-            body: Any = resp.json()
-        except ValueError as e:
-            raise ProverkaCheckaError("Unexpected non-JSON response from ProverkaCheka") from e
-        if not isinstance(body, dict):
-            raise ProverkaCheckaError("Unexpected response format from ProverkaCheka")
-
+        body: dict[str, object] = resp.json()
         code = body.get("code")
+        if code == 2:
+            raise ProverkaCheckaError("Чек не найден в ФНС")
         if code != 1:
-            raise ProverkaCheckaError(_format_api_error(code, body.get("data")))
+            raise ProverkaCheckaError(f"Unexpected code={code}: {body.get('data')}")
 
         raw_data = body.get("data", {})
         if not isinstance(raw_data, dict):
@@ -98,15 +88,6 @@ class ProverkaCheckaClient:
 # ── Internal parsers ──────────────────────────────────────────────────────────
 
 
-def _format_api_error(code: object, data: object) -> str:
-    message = _ERROR_MESSAGES.get(code)
-    if message is None:
-        message = f"ProverkaCheka вернула code={code}"
-    if data:
-        return f"{message}: {data}"
-    return message
-
-
 def _build_receipt(
     data: dict[str, object],
     *,
@@ -115,8 +96,6 @@ def _build_receipt(
     member_id: str,
 ) -> Receipt:
     """Map ProverkaCheka JSON response to Receipt domain object."""
-    import uuid
-
     # purchase_time: "20260502T1234" or "2026-05-02T12:34:00"
     purchase_time = _parse_datetime(str(data.get("dateTime", "")))
 
@@ -164,7 +143,7 @@ def _parse_datetime(raw: str) -> datetime:
             return dt.replace(tzinfo=UTC)
         except ValueError:
             pass
-    logger.warning("proverkacheka: cannot parse datetime %r, using now(UTC)", raw)
+    logger.warning("proverkacheka_datetime_unparsed", raw=raw, fallback="now(UTC)")
     return datetime.now(UTC)
 
 
@@ -202,5 +181,5 @@ def _parse_items(raw: object) -> list[ReceiptItem]:
                 )
             )
         except Exception:
-            logger.warning("proverkacheka: could not parse item %r", entry)
+            logger.warning("proverkacheka_item_unparsed", entry=entry)
     return items

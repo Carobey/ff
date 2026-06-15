@@ -26,6 +26,7 @@ from aiohttp import AsyncResolver, ClientSession
 
 from family_finance.bot.handlers import register_all_handlers
 from family_finance.bot.scheduler import start_scheduler
+from family_finance.infrastructure.mcp.client import close_finance_tools, get_finance_tools
 from family_finance.infrastructure.memory import get_checkpointer
 from family_finance.infrastructure.memory.graphiti_client import graphiti_init
 from family_finance.infrastructure.observability import flush, get_langfuse
@@ -59,14 +60,15 @@ async def amain() -> None:
     # Прогреваем LangFuse (проверяем что отвечает)
     get_langfuse()
 
-    # Force IPv4 + use public DNS for the Telegram session.
+    # Force IPv4 + use public DNS for the Telegram session (dev-only, gated).
     #
-    # Why: on the dev network the local resolver (router / Yandex DNS) returns
+    # Why: on some dev networks the local resolver (router / Yandex DNS) returns
     # ONLY AAAA records for api.telegram.org, and the resulting IPv6 address
     # is not routable. ``family=AF_INET`` alone isn't enough — getaddrinfo
     # then returns nothing and raises EAI_AGAIN ("Temporary failure in name
     # resolution"). The AsyncResolver bypasses the local resolver entirely
-    # and queries Cloudflare/Google directly.
+    # and queries Cloudflare/Google directly. Off by default — opt in via
+    # ``TELEGRAM_FORCE_IPV4_DNS=true`` only where the network needs it.
     class _TelegramSession(AiohttpSession):
         async def create_session(self) -> ClientSession:
             resolver = AsyncResolver(nameservers=["1.1.1.1", "8.8.8.8"])
@@ -80,7 +82,7 @@ async def amain() -> None:
     bot = Bot(
         token=settings.telegram_bot_token.get_secret_value(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        session=_TelegramSession(),
+        session=_TelegramSession() if settings.telegram_force_ipv4_dns else None,
     )
     dp = Dispatcher()
 
@@ -96,6 +98,16 @@ async def amain() -> None:
         from family_finance.agents import build_supervisor_graph
 
         graph = build_supervisor_graph(checkpointer)
+
+        # Прогреваем MCP-сессию в главной задаче: stdio-сессия живёт один subprocess
+        # и не выдерживает конкурентного открытия из параллельных воркеров (веер
+        # Send, ADR 0008). Открыв её здесь, мы (а) убираем гонку ленивой инициализации
+        # и (б) открываем и закрываем cancel scope в одной задаче — чистый shutdown.
+        try:
+            await get_finance_tools()
+        except Exception:
+            log.warning("mcp.warmup_failed", hint="проверь family_finance.mcp_server.server")
+
         # Передаём graph через workflow_data — доступен в хендлерах через data["graph"]
         dp["graph"] = graph
         dp["settings"] = settings
@@ -112,6 +124,8 @@ async def amain() -> None:
         finally:
             log.info("shutdown.scheduler")
             scheduler.shutdown(wait=False)
+            log.info("shutdown.mcp")
+            await close_finance_tools()
             log.info("shutdown.flush_langfuse")
             flush()
             log.info("shutdown.done")

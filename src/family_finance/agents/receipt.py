@@ -113,7 +113,9 @@ def _categorise_item(name: str) -> Category:
     for tokens, cat in _ITEM_CATEGORY_RULES:
         if any(t in lower for t in tokens):
             return cat
-    return Category.FOOD_GROCERIES  # safe default for shop receipts
+    # Unmatched item: honest UNCLASSIFIED (needs_review) beats a wrong "groceries"
+    # guess — a pharmacy/clothing line must not silently become food.
+    return Category.UNCLASSIFIED
 
 
 # ── Receipt → Transaction mapper ──────────────────────────────────────────────
@@ -167,7 +169,7 @@ def receipt_to_transactions(
             currency=Currency.RUB,
             direction=Direction.EXPENSE,
             merchant_raw=store,
-            category=Category.FOOD_GROCERIES,
+            category=Category.UNCLASSIFIED,
             confidence=0.4,
             source=TransactionSource.RECEIPT_PHOTO_QR,
             source_file=None,

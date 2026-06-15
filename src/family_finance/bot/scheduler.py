@@ -75,6 +75,9 @@ def schedule_for_member(
         kwargs={
             "bot": bot,
             "family_id_str": str(family_id),
+            # Assumes a 1:1 private chat where chat.id == user.id. For a group chat
+            # these differ, so the digest would DM the user instead of posting to
+            # the group — acceptable for the personal-bot use case.
             "chat_id": telegram_user_id,
         },
         id=_job_id(member_id),

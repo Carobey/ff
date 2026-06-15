@@ -1,52 +1,69 @@
-"""CoachAgent: behavioural finance queries via Graphiti episodic memory (P2-19).
+"""CoachAgent: behavioural finance queries (QA-01, was P2-19).
 
-Handles questions like:
-  "Когда я последний раз так часто заказывал доставку?"
-  "Я обычно столько трачу на одежду или это аномалия?"
-  "В какой месяц этого года я тратил меньше всего?"
+Handles open-ended questions about spending behaviour:
+  "Как часто я заказываю доставку?"
+  "Когда я последний раз так тратил?"
+  "А так ли это для меня типично?"
 
-Flow:
-  1. search_episodes(user_query, group_id=family_id) → EntityEdge[]
-  2. Format edges as context facts
-  3. LLM (worker) generates a 2-4 sentence narrative from those facts
+Approach — ReAct over MCP tools, mirroring ``advisor_node``: the LLM decides
+*what* to look up and narrates the result, but every number comes from a
+Python tool (MCP aggregate / transaction list), never from the model. Graphiti
+episodic memory is exposed as one optional tool (``recall_episodes``) for
+qualitative recall, so the diploma's episodic-memory story (P2-18/19) is kept
+without being the only data source — which was the root cause of the old
+"нет данных" answers (it held aggregate import episodes, no dated facts).
+
+``family_id`` is baked into the tool closures — the LLM never sees the UUID and
+cannot query another family's data (security layer, like advisor).
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import Protocol, runtime_checkable
+import zoneinfo
+from datetime import datetime
+from decimal import Decimal
+from typing import Literal
 
 import structlog
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool, tool
+from langgraph.prebuilt import create_react_agent
 
-from family_finance.agents._messages import message_text
+from family_finance.agents._messages import message_text, recent_dialog
+from family_finance.agents.ledger import parse_period
+from family_finance.agents.ledger_terms import CATEGORY_LABELS
 from family_finance.agents.state import FinanceState
+from family_finance.domain import Category, Direction
 from family_finance.infrastructure.llm import get_chat_model
+from family_finance.infrastructure.mcp import call_finance_tool
 from family_finance.infrastructure.memory.graphiti_client import search_episodes
 
 logger = structlog.get_logger()
 
+_MOSCOW = zoneinfo.ZoneInfo("Europe/Moscow")
 
-@runtime_checkable
-class _GraphitiEdge(Protocol):
-    """Structural shape of a Graphiti EntityEdge we care about.
+_COACH_REACT_SYSTEM = """\
+Ты — финансовый коуч семьи. Отвечаешь на поведенческие вопросы о тратах
+(как часто, когда последний раз, типично ли, есть ли всплеск) по-русски.
 
-    We don't import ``graphiti_core.edges.EntityEdge`` directly because the
-    coach module shouldn't depend on Graphiti's internal class layout — any
-    object with the right attributes works (handy for tests too).
-    """
+У тебя есть инструменты, которые отдают УЖЕ ПОСЧИТАННЫЕ Python-ом цифры по
+этой семье:
+- spending_breakdown — суммы и КОЛИЧЕСТВО операций в разбивке по категориям,
+  продавцам, месяцам или неделям за период (count = как часто).
+- recent_transactions — последние операции с датами (для «когда последний раз»).
+- recall_episodes — качественные заметки из истории (эпизодическая память).
 
-    fact: str | None
-    name: str | None
-
-
-_COACH_SYSTEM = """\
-Ты — финансовый коуч семьи. Анализируй паттерны расходов и отвечай по-русски.
-Правила:
-- Отвечай 2-4 предложениями, конкретно и с цифрами если они есть
-- Используй ТОЛЬКО факты из предоставленного контекста, не придумывай
-- Если контекста недостаточно для ответа — честно скажи об этом
-- Не давай финансовых советов — только наблюдения из истории трат
+ПРАВИЛА:
+- Сначала вызови нужные инструменты, чтобы узнать реальные цифры/даты. Используй
+  ТОЛЬКО эти данные — НИКОГДА не выдумывай суммы, количества и даты.
+- Для «как часто» смотри количество операций (count) за период.
+- Для «когда последний раз» бери дату из recent_transactions.
+- Дёргай ровно те инструменты, что нужны под вопрос; не вызывай лишние.
+- Итог — 2-4 предложения, конкретно, суммы с пробелами между тысячами («12 300 ₽»).
+- Только наблюдения из истории, без финансовых советов.
+- Если данных нет — честно скажи и предложи загрузить выписку.
 """
 
 _NO_DATA_REPLY = (
@@ -54,69 +71,173 @@ _NO_DATA_REPLY = (
     "Загрузи выписку банка или больше чеков — тогда смогу анализировать паттерны."
 )
 
+_DIM_TITLE: dict[str, str] = {
+    "category": "по категориям",
+    "merchant": "по продавцам",
+    "month": "по месяцам",
+    "week": "по неделям",
+}
+
 
 async def coach_node(state: FinanceState) -> dict[str, object]:
-    """Answer a behavioural finance question using Graphiti episodic memory."""
-    last_human = next(
-        (m for m in reversed(state.get("messages", [])) if isinstance(m, HumanMessage)),
-        None,
-    )
-    user_text = str(last_human.content) if last_human else ""
-    family_id = str(uuid.UUID(state["family_id"]))
+    """Answer a behavioural finance question via a ReAct loop over MCP tools.
 
-    # 1. Semantic search in Graphiti knowledge graph
-    edges = await search_episodes(
-        query=user_text,
-        group_id=family_id,
-        num_results=15,
-    )
+    Числа считает Python (MCP-инструменты), LLM лишь решает, что спросить, и
+    оборачивает результат в наблюдение. Маскирование PII сохраняется — ReAct
+    ходит через ``MaskingChatModel``.
+    """
+    family_id = uuid.UUID(state["family_id"])
 
-    if not edges:
-        return {
-            "messages": [AIMessage(content=_NO_DATA_REPLY)],
-            "current_intent": "idle",
-        }
+    # Дешёвый гейт без LLM: совсем пустая история → честный ответ, не гоняем
+    # ReAct-цикл впустую.
+    if not await _has_transactions(family_id):
+        return {"messages": [AIMessage(content=_NO_DATA_REPLY)], "current_intent": "idle"}
 
-    # 2. Format edges as context facts for LLM
-    context_lines: list[str] = []
-    for edge in edges:
-        fact = _edge_to_fact(edge)
-        if fact:
-            context_lines.append(f"• {fact}")
-
-    if not context_lines:
-        return {
-            "messages": [AIMessage(content=_NO_DATA_REPLY)],
-            "current_intent": "idle",
-        }
-
-    context = "\n".join(context_lines[:15])
-    user_prompt = f"Вопрос пользователя: «{user_text}»\n\nФакты из истории трат:\n{context}"
-
-    # 3. LLM narrative
+    # История диалога (хвост), чтобы уточняющие вопросы держали антецедент.
+    dialog = recent_dialog(state.get("messages", []))
+    tools = _build_coach_tools(family_id)
     try:
-        model = get_chat_model(tier="worker")
-        response = await model.ainvoke(
-            [SystemMessage(content=_COACH_SYSTEM), HumanMessage(content=user_prompt)],
+        agent = create_react_agent(
+            get_chat_model(tier="worker"),
+            tools,
+            prompt=_COACH_REACT_SYSTEM,
         )
-        reply = message_text(response)
+        config: RunnableConfig = {"recursion_limit": 10}
+        result = await agent.ainvoke({"messages": dialog}, config=config)
+        reply = message_text(result["messages"][-1]).strip()
+        if not reply:
+            raise ValueError("empty coach reply")
     except Exception:
-        logger.exception("coach_node: llm failed")
-        # Fallback: return raw facts
-        reply = "Нашёл в истории:\n" + context
+        logger.exception("coach_react_failed")
+        reply = _NO_DATA_REPLY
 
-    return {
-        "messages": [AIMessage(content=reply)],
-        "current_intent": "idle",
-    }
+    return {"messages": [AIMessage(content=reply)], "current_intent": "idle"}
+
+
+async def _has_transactions(family_id: uuid.UUID) -> bool:
+    """True if the family has at least one expense on record (all-time)."""
+    rows = await call_finance_tool(
+        "query_aggregates",
+        {
+            "family_id": str(family_id),
+            "group_by": "total",
+            "directions": [Direction.EXPENSE.value],
+        },
+    )
+    return bool(rows) and int(rows[0].get("count", 0)) > 0
+
+
+def _build_coach_tools(family_id: uuid.UUID) -> list[BaseTool]:
+    """ReAct-инструменты коуча. ``family_id`` зашит в замыкание — LLM никогда не
+    видит UUID семьи и не может запросить чужие данные (см. security-слой).
+
+    Все числа приходят из MCP (SQL-агрегаты) и Graphiti — модель только читает.
+    """
+
+    @tool
+    async def spending_breakdown(
+        dimension: Literal["category", "merchant", "month", "week"],
+        period_hint: str = "",
+    ) -> str:
+        """Суммы и количество операций в разбивке за период.
+
+        ``dimension`` — ось разбивки: category/merchant/month/week.
+        ``period_hint`` — свободный текст периода («в апреле», «за прошлый месяц»,
+        пусто = за всё время). Для «как часто» смотри количество операций.
+        """
+        start, end, period_label = parse_period(period_hint)
+        rows = await call_finance_tool(
+            "query_aggregates",
+            {
+                "family_id": str(family_id),
+                "group_by": dimension,
+                "directions": [Direction.EXPENSE.value],
+                "start": start.isoformat() if start else None,
+                "end": end.isoformat() if end else None,
+                "limit": 20,
+            },
+        )
+        if not rows:
+            return f"Трат {period_label} не найдено."
+        lines = [f"Траты {period_label} — {_DIM_TITLE.get(dimension, dimension)}:"]
+        for r in rows:
+            label = _bucket_label(dimension, str(r["bucket"]))
+            total = Decimal(str(r["total"]))
+            count = int(r["count"])
+            lines.append(f"• {label}: {_money(total)} ({count} операций)")
+        return "\n".join(lines)
+
+    @tool
+    async def recent_transactions(period_hint: str = "", limit: int = 15) -> str:
+        """Последние операции с датами (новые сверху).
+
+        ``period_hint`` — свободный текст периода (пусто = за всё время).
+        Используй для вопросов «когда последний раз …».
+        """
+        start, end, period_label = parse_period(period_hint)
+        rows = await call_finance_tool(
+            "list_transactions",
+            {
+                "family_id": str(family_id),
+                "directions": [Direction.EXPENSE.value],
+                "start": start.isoformat() if start else None,
+                "end": end.isoformat() if end else None,
+                "order_by": "date_desc",
+                "limit": max(1, min(limit, 50)),
+            },
+        )
+        if not rows:
+            return f"Операций {period_label} не найдено."
+        lines = [f"Последние операции {period_label}:"]
+        for e in rows:
+            occurred = datetime.fromisoformat(str(e["occurred_at"]))
+            label = _bucket_label("category", str(e["category"]))
+            merchant = str(e["merchant"]) or "—"
+            lines.append(
+                f"• {occurred.strftime('%d.%m.%Y')} {merchant} ({label}): "
+                f"{_money(Decimal(str(e['amount'])))}"
+            )
+        return "\n".join(lines)
+
+    @tool
+    async def recall_episodes(query: str) -> str:
+        """Качественные заметки из истории трат (эпизодическая память).
+
+        Поиск по смыслу в графе знаний семьи. Используй для контекста, когда
+        нужны не цифры, а наблюдения («был ли всплеск», «что необычного»).
+        """
+        edges = await search_episodes(query=query, group_id=str(family_id), num_results=10)
+        facts = [f"• {fact}" for edge in edges if (fact := _edge_to_fact(edge))]
+        if not facts:
+            return "В эпизодической памяти ничего по этому запросу не нашлось."
+        return "Заметки из истории:\n" + "\n".join(facts)
+
+    return [spending_breakdown, recent_transactions, recall_episodes]
+
+
+def _bucket_label(dimension: str, bucket: str) -> str:
+    """Human label for one aggregation bucket key (category → RU label)."""
+    if dimension == "category":
+        try:
+            return CATEGORY_LABELS.get(Category(bucket), bucket)
+        except ValueError:
+            return bucket
+    return bucket  # merchant / month (YYYY-MM) / week (date) — raw
+
+
+def _money(value: Decimal) -> str:
+    """Format Decimal as ``1 234 ₽`` (space thousands sep)."""
+    return f"{int(value):,}".replace(",", " ") + " ₽"
 
 
 def _edge_to_fact(edge: object) -> str | None:
-    """Extract a human-readable fact string from a Graphiti EntityEdge."""
-    if not isinstance(edge, _GraphitiEdge):
-        return None
-    if edge.fact and isinstance(edge.fact, str):
-        return edge.fact.strip()
-    if edge.name and isinstance(edge.name, str):
-        return edge.name.strip()
+    """Extract a human-readable fact string from a Graphiti EntityEdge.
+
+    Duck-typed on purpose: we don't import Graphiti's ``EntityEdge`` class, any
+    object exposing a ``fact``/``name`` string works (also handy for tests).
+    """
+    for attr in ("fact", "name"):
+        value = getattr(edge, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return None

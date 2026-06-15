@@ -9,7 +9,9 @@ Casting to ``str`` silently lies in the block case (you get
 
 from __future__ import annotations
 
-from langchain_core.messages import BaseMessage
+from collections.abc import Sequence
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 
 def message_text(message: BaseMessage) -> str:
@@ -31,3 +33,16 @@ def message_text(message: BaseMessage) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "".join(parts)
+
+
+def recent_dialog(messages: Sequence[BaseMessage], *, limit: int = 6) -> list[BaseMessage]:
+    """Last ``limit`` Human/AI text turns for ReAct context (newest at the end).
+
+    ReAct-ноды (coach/advisor) запускают свой цикл с историей диалога, чтобы
+    уточняющие вопросы («а так ли это типично?») сохраняли антецедент. Берём
+    только Human/AI-сообщения: tool/system-сообщения ReAct в граф-стейт не
+    попадают, а раздувать промпт незачем (context rot). Хвост заканчивается
+    текущим вопросом пользователя — он всегда последний в стейте.
+    """
+    turns: list[BaseMessage] = [m for m in messages if isinstance(m, HumanMessage | AIMessage)]
+    return turns[-limit:]

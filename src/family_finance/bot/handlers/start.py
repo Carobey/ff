@@ -11,11 +11,11 @@ Phase 0:
 
 from __future__ import annotations
 
-import logging
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, cast
 
+import structlog
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
@@ -24,6 +24,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command as GraphCommand
 
 from family_finance.agents.advisor import goal_status_text
 from family_finance.agents.budgets import (
@@ -33,13 +34,21 @@ from family_finance.agents.budgets import (
 )
 from family_finance.agents.digest import build_digest
 from family_finance.agents.digest_schedule_parser import parse_digest_schedule
+from family_finance.bot.handlers.documents import (
+    format_import_preview,
+    import_confirm_keyboard,
+    send_import_result,
+)
+from family_finance.bot.handlers.tax_confirm import (
+    format_tax_questions,
+    parse_tax_answers,
+)
 from family_finance.bot.scheduler import schedule_for_member, unschedule_member
-from family_finance.bot.telegram_text import answer_plain
 from family_finance.infrastructure.observability import make_callback_handler
 from family_finance.infrastructure.persistence import PostgresTransactionRepository
 from family_finance.infrastructure.settings import Settings
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 router = Router(name="start")
 
 
@@ -84,6 +93,7 @@ async def _invoke_graph(
     *,
     user_text: str,
     trace_name: str,
+    tags: list[str],
 ) -> None:
     """Common path: feed *user_text* into the supervisor graph and reply."""
     user_id = message.from_user.id if message.from_user else 0
@@ -103,7 +113,7 @@ async def _invoke_graph(
             "telegram_chat_id": str(message.chat.id),
             "langfuse_user_id": str(user_id),
             "langfuse_session_id": thread_id,
-            "langfuse_tags": ["telegram"],
+            "langfuse_tags": tags,
             "langfuse_trace_name": trace_name,
         },
     }
@@ -124,8 +134,31 @@ async def _invoke_graph(
         await message.answer("⚠️ Не смог обработать сообщение. Подробности уже в логах.")
         return
 
+    if await _maybe_render_interrupt(message, result):
+        return
     reply = result["messages"][-1].content
-    await answer_plain(message, reply)
+    await message.answer(str(reply))
+
+
+async def _maybe_render_interrupt(message: Message, result: dict[str, Any]) -> bool:
+    """Render a HITL pause (``__interrupt__``) instead of the last message.
+
+    tax-вычет (ADR 0010) → текстовая форма вопросов; импорт (ADR 0009) → карточка
+    превью с кнопками. Без этого пауза ``interrupt()`` повисла бы молча. Возвращает
+    ``True``, если граф на паузе и мы уже ответили.
+    """
+    interrupts = result.get("__interrupt__")
+    if not interrupts:
+        return False
+    payload = interrupts[0].value
+    if isinstance(payload, dict) and payload.get("kind") == "tax_deduction_input":
+        await message.answer(format_tax_questions(payload))
+        return True
+    await message.answer(
+        format_import_preview(payload),
+        reply_markup=import_confirm_keyboard(),
+    )
+    return True
 
 
 @router.message(Command("subscriptions"))
@@ -143,6 +176,7 @@ async def cmd_subscriptions(
         graph,
         user_text="мои подписки",
         trace_name="telegram-subscriptions",
+        tags=["telegram", "phase2", "subscriptions"],
     )
 
 
@@ -447,4 +481,104 @@ async def handle_any_message(
         await message.answer("Пока понимаю только текст / файлы / фото.")
         return
 
-    await _invoke_graph(message, graph, user_text=message.text, trace_name="telegram-message")
+    # Если тред стоит на HITL-паузе подтверждения импорта (ADR 0009) — трактуем
+    # текст как ответ «да»/«нет» и возобновляем граф, а не маршрутизируем заново.
+    thread_id = f"tg:{message.chat.id}"
+    snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+    if snapshot.interrupts:
+        payload = snapshot.interrupts[0].value
+        if isinstance(payload, dict) and payload.get("kind") == "tax_deduction_input":
+            await _resume_pending_tax(message, graph, message.text)
+        else:
+            await _resume_pending_import(message, graph, message.text)
+        return
+
+    await _invoke_graph(
+        message,
+        graph,
+        user_text=message.text,
+        trace_name="telegram-message",
+        tags=["telegram", "phase3", "chat"],
+    )
+
+
+_YES_WORDS = {"да", "yes", "y", "ок", "ok", "подтверждаю", "импортируй", "импортировать"}
+_NO_WORDS = {"нет", "no", "n", "отмена", "отмени", "не надо", "не импортируй"}
+
+
+async def _resume_pending_import(
+    message: Message,
+    graph: CompiledStateGraph[Any, Any, Any, Any],
+    text: str,
+) -> None:
+    """Resume an import paused on the confirm-interrupt using a free-text yes/no."""
+    normalized = text.strip().lower()
+    if normalized in _YES_WORDS:
+        confirmed = True
+    elif normalized in _NO_WORDS:
+        confirmed = False
+    else:
+        await message.answer(
+            "Сначала подтверди импорт выписки: нажми кнопку выше "
+            "(✅ Импортировать / 🛑 Отмена) или ответь «да» / «нет»."
+        )
+        return
+
+    user_id = message.from_user.id if message.from_user else 0
+    thread_id = f"tg:{message.chat.id}"
+    callbacks = cast("list[BaseCallbackHandler]", [make_callback_handler()])
+    config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": callbacks,
+        "metadata": {
+            "telegram_user_id": str(user_id),
+            "telegram_chat_id": str(message.chat.id),
+            "langfuse_user_id": str(user_id),
+            "langfuse_session_id": thread_id,
+            "langfuse_tags": ["telegram", "phase1", "import_confirm"],
+            "langfuse_trace_name": "telegram-import-confirm-text",
+        },
+    }
+    try:
+        result = await graph.ainvoke(GraphCommand(resume=confirmed), config=config)
+    except Exception:
+        logger.exception("import resume from text failed")
+        await message.answer("⚠️ Не смог завершить импорт. Подробности в логах.")
+        return
+    await send_import_result(message, result)
+
+
+async def _resume_pending_tax(
+    message: Message,
+    graph: CompiledStateGraph[Any, Any, Any, Any],
+    text: str,
+) -> None:
+    """Resume a tax-deduction estimate paused on the HITL interrupt (ADR 0010).
+
+    Свободный ответ юзера парсим в ``dict`` (доход + флаги) и возобновляем граф.
+    Пустой/частичный dict валиден — ``tax_node`` достроит консервативно.
+    """
+    answers = parse_tax_answers(text)
+    user_id = message.from_user.id if message.from_user else 0
+    thread_id = f"tg:{message.chat.id}"
+    callbacks = cast("list[BaseCallbackHandler]", [make_callback_handler()])
+    config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": callbacks,
+        "metadata": {
+            "telegram_user_id": str(user_id),
+            "telegram_chat_id": str(message.chat.id),
+            "langfuse_user_id": str(user_id),
+            "langfuse_session_id": thread_id,
+            "langfuse_tags": ["telegram", "phase3", "tax_confirm"],
+            "langfuse_trace_name": "telegram-tax-confirm-text",
+        },
+    }
+    try:
+        result = await graph.ainvoke(GraphCommand(resume=answers), config=config)
+    except Exception:
+        logger.exception("tax resume from text failed")
+        await message.answer("⚠️ Не смог завершить расчёт вычета. Подробности в логах.")
+        return
+    reply = result["messages"][-1].content
+    await message.answer(str(reply))

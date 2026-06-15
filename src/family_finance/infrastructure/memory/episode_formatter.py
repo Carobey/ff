@@ -13,12 +13,13 @@ episode name: "{family_id}:{import_hash[:8]}" — globally unique, stable.
 
 from __future__ import annotations
 
+import hashlib
 import zoneinfo
 from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 
-from family_finance.domain import Direction, Transaction
+from family_finance.domain import Category, Direction, Transaction
 from family_finance.domain.receipt import Receipt
 
 _MOSCOW = zoneinfo.ZoneInfo("Europe/Moscow")
@@ -133,3 +134,66 @@ def _fmt_amount_decimal(value: Decimal) -> str:
     if frac:
         return f"{formatted},{frac:02d} ₽"
     return f"{formatted} ₽"
+
+
+# ── Import summary episode (bulk CSV/PDF) ─────────────────────────────────────
+
+# How many top categories to enumerate in the summary body. Bounds the episode
+# text so Graphiti's extraction stays cheap on large imports.
+_IMPORT_TOP_CATEGORIES = 8
+
+
+def make_import_episode_name(transactions: Sequence[Transaction]) -> str:
+    """Stable, unique episode name for one import batch (hash of its rows)."""
+    digest = hashlib.sha256()
+    for tx in sorted(transactions, key=lambda t: t.import_hash or str(t.transaction_id)):
+        digest.update((tx.import_hash or str(tx.transaction_id)).encode())
+    return f"import:{digest.hexdigest()[:12]}"
+
+
+def import_to_episode_body(
+    transactions: Sequence[Transaction],
+    *,
+    owner_name: str = "Юри",
+) -> str:
+    """Summarise a whole bulk import as ONE episode body (not per transaction).
+
+    Per-tx episodes would cost ~4 LLM calls each (~400 for a 100-row CSV), so
+    bulk imports write a single aggregate episode instead: period, total, and the
+    largest expense categories. That still gives the entity extractor enough text
+    to relate categories/periods, which is what CoachAgent retrieves later.
+    """
+    expenses = [tx for tx in transactions if tx.direction == Direction.EXPENSE]
+    if not expenses:
+        return f"{owner_name}: импорт выписки без расходных операций."
+
+    occurred = [tx.occurred_at for tx in expenses]
+    period = _fmt_period(min(occurred), max(occurred))
+    total = sum((tx.amount for tx in expenses), Decimal("0"))
+
+    by_category: dict[Category, tuple[Decimal, int]] = {}
+    for tx in expenses:
+        amount, count = by_category.get(tx.category, (Decimal("0"), 0))
+        by_category[tx.category] = (amount + tx.amount, count + 1)
+
+    ranked = sorted(by_category.items(), key=lambda kv: kv[1][0], reverse=True)
+    header = (
+        f"{owner_name}: импорт выписки {period} — {len(expenses)} операций "
+        f"на {_fmt_amount_decimal(total)}"
+    )
+    lines = [
+        f"- {category.value}: {_fmt_amount_decimal(amount)} ({count})"
+        for category, (amount, count) in ranked[:_IMPORT_TOP_CATEGORIES]
+    ]
+    return header + ":\n" + "\n".join(lines)
+
+
+def _fmt_period(start: datetime, end: datetime) -> str:
+    """Format an import date range as '1–31 мая 2026' (Moscow time)."""
+    s = start.astimezone(_MOSCOW)
+    e = end.astimezone(_MOSCOW)
+    if s.year == e.year and s.month == e.month:
+        if s.day == e.day:
+            return _fmt_date(start)
+        return f"{s.day}–{e.day} {_MONTHS_GEN[e.month]} {e.year}"
+    return f"{_fmt_date(start)} — {_fmt_date(end)}"

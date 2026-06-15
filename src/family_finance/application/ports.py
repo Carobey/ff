@@ -37,6 +37,83 @@ class LedgerSummary:
     count: int
 
 
+@dataclass(frozen=True)
+class LedgerBucket:
+    """One row of a grouped aggregation (``query_aggregates``).
+
+    ``bucket`` is the group key as a display string — a date (``2026-04-01``),
+    a month (``2026-04``), a category value or a merchant name, depending on the
+    requested ``group_by``.
+
+    ``subbucket`` is the secondary group key when a 2-D breakdown is requested
+    (``then_by``), e.g. category within a day for «по дням по категориям».
+    ``None`` for a plain one-dimensional aggregation.
+    """
+
+    bucket: str
+    total: Decimal
+    count: int
+    subbucket: str | None = None
+
+
+@dataclass(frozen=True)
+class LedgerEntry:
+    """A single transaction row returned by ``list_transactions``."""
+
+    occurred_at: datetime
+    amount: Decimal
+    direction: Direction
+    category: Category
+    merchant: str
+
+
+@dataclass(frozen=True)
+class MerchantRuleHit:
+    """A matched merchant→category rule from the categorization cascade."""
+
+    category: Category
+    score: float  # fuzzy similarity 0..1
+    source: str  # seed | user | llm
+
+
+@runtime_checkable
+class CategoryCatalog(Protocol):
+    """Read-only справочник категорий (таксономия для промпта категоризатора)."""
+
+    async def render_taxonomy(self) -> str:
+        """Вернуть готовый блок «КАТЕГОРИИ» для system-промпта (по строке на код)."""
+        ...
+
+
+@runtime_checkable
+class MerchantRuleRepository(Protocol):
+    """Каскад «продавец → категория»: fuzzy-lookup + дозапись выученных правил."""
+
+    async def lookup_many(
+        self,
+        *,
+        family_id: uuid.UUID,
+        merchants: Sequence[str],
+        threshold: float,
+    ) -> dict[str, MerchantRuleHit]:
+        """Сопоставить продавцов правилам. Ключ результата — исходный `merchant_raw`.
+
+        Возвращает только попадания со score ≥ threshold (промахи отсутствуют в dict).
+        """
+        ...
+
+    async def upsert(
+        self,
+        *,
+        family_id: uuid.UUID,
+        merchant_raw: str,
+        category: Category,
+        source: str = "user",
+    ) -> None:
+        """Записать/обновить правило семьи (learning loop из clarify-ноды)."""
+        ...
+
+
 @runtime_checkable
 class TransactionRepository(Protocol):
     """Persistence для транзакций."""
@@ -70,6 +147,43 @@ class TransactionRepository(Protocol):
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> LedgerSummary: ...
+
+    async def query_aggregates(
+        self,
+        *,
+        family_id: uuid.UUID,
+        group_by: str,
+        then_by: str | None = None,
+        categories: Sequence[Category] = (),
+        directions: Sequence[Direction] = (),
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+    ) -> list[LedgerBucket]:
+        """Grouped sums over a flexible dimension (day/week/month/category/merchant/total).
+
+        Empty ``categories``/``directions`` mean "no filter". ``group_by`` must be
+        one of the supported dimensions — anything else raises ``ValueError``.
+
+        ``then_by`` adds a second grouping dimension (same whitelist) so the rows
+        carry a ``subbucket``, e.g. ``group_by="day", then_by="category"`` for a
+        «по дням по категориям» breakdown.
+        """
+        ...
+
+    async def list_transactions(
+        self,
+        *,
+        family_id: uuid.UUID,
+        categories: Sequence[Category] = (),
+        directions: Sequence[Direction] = (),
+        start: datetime | None = None,
+        end: datetime | None = None,
+        order_by: str = "date_desc",
+        limit: int = 20,
+    ) -> list[LedgerEntry]:
+        """Raw transaction rows, newest-first or biggest-first (``order_by``)."""
+        ...
 
     async def classify_by_import_hashes(
         self,

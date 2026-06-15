@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import logging
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
+import structlog
 from aiogram import Bot, F, Router
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from langchain_core.callbacks import BaseCallbackHandler
@@ -16,12 +16,11 @@ from langgraph.graph.state import CompiledStateGraph
 
 from family_finance.agents.clarifications import ClarificationQuestion
 from family_finance.bot.handlers.clarify_buttons import make_callback_data
-from family_finance.bot.telegram_text import answer_plain
 from family_finance.infrastructure.observability import make_callback_handler
 from family_finance.infrastructure.persistence import PostgresTransactionRepository
 from family_finance.infrastructure.settings import Settings
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 router = Router(name="documents")
 
 
@@ -49,6 +48,11 @@ async def handle_document(
     document = message.document
     if document is None:
         await message.answer("Файл не найден в сообщении.")
+        return
+
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    if document.file_size is not None and document.file_size > max_bytes:
+        await message.answer(f"⛔ Файл больше {settings.max_upload_mb} МБ — не принимаю.")
         return
 
     filename = document.file_name or document.file_unique_id
@@ -124,16 +128,67 @@ async def handle_document(
         await message.answer("⚠️ Не смог импортировать выписку. Подробности уже в логах.")
         return
 
+    await send_import_result(message, result)
+
+
+# ── Import result surfacing (interrupt card / reply + questions) ───────────────
+
+# Callback data for the HITL import-confirmation buttons (см. import_confirm_buttons.py).
+IMPORT_CONFIRM_YES = "import:yes"
+IMPORT_CONFIRM_NO = "import:no"
+
+
+def import_confirm_keyboard() -> InlineKeyboardMarkup:
+    """Two-button keyboard: confirm or cancel a pending bulk import."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Импортировать", callback_data=IMPORT_CONFIRM_YES),
+                InlineKeyboardButton(text="🛑 Отмена", callback_data=IMPORT_CONFIRM_NO),
+            ]
+        ]
+    )
+
+
+def format_import_preview(payload: dict[str, Any]) -> str:
+    """Render the ``interrupt()`` payload from ingest into a confirmation card."""
+    return (
+        f"📄 Разобрал выписку ({payload.get('bank')}).\n"
+        f"Нашёл <b>{payload.get('count')}</b> операций "
+        f"за период {payload.get('period_start')} — {payload.get('period_end')}.\n\n"
+        "Импортировать в базу?"
+    )
+
+
+async def send_import_result(message: Message, result: dict[str, Any]) -> None:
+    """Surface a graph result that may be paused on the import-confirm interrupt.
+
+    Paused (``__interrupt__`` present) → show the preview card with confirm buttons.
+    Otherwise → normal reply text plus inline-keyboard clarification questions.
+    """
+    interrupts = result.get("__interrupt__")
+    if interrupts:
+        await message.answer(
+            format_import_preview(interrupts[0].value),
+            reply_markup=import_confirm_keyboard(),
+        )
+        return
+
     reply = result["messages"][-1].content
-    await answer_plain(message, reply)
+    await message.answer(str(reply))
 
     # Send inline-keyboard questions for needs_review transactions
     open_questions: list[ClarificationQuestion] = result.get("open_questions") or []
     for question in open_questions:
         if not question.get("import_hashes"):
             continue  # summary placeholder
+        qid = question["id"]
+        hint = (
+            f"💬 Не та категория на кнопках? Напиши своими словами: «{qid} спортзал» "
+            f"или «{qid} не знаю» — поищу в интернете."
+        )
         await message.answer(
-            question["text"],
+            f"{question['text']}\n\n{hint}",
             reply_markup=_build_question_keyboard(question),
         )
 
@@ -151,6 +206,7 @@ _COMMON_BUTTONS: list[tuple[str, str]] = [
     ("💇 Красота/здоровье", "health.generic"),
     ("🎬 Подписки", "entertainment.subscriptions"),
     ("↔️ Перевод", "transfer.internal"),
+    ("🔎 Не знаю", "__lookup__"),
     ("❓ Непонятно", "unclassified"),
 ]
 

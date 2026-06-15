@@ -9,6 +9,13 @@ without touching the database directly.
 Read-only by design: no tool writes to the DB. Money is returned as strings
 (the repo already casts NUMERIC→TEXT) so no float ever crosses the wire.
 
+⚠️ Trust boundary: ``family_id`` is a caller-supplied parameter and is NOT
+authorized here — any client can read any family's data by passing a different
+UUID. This server is therefore **single-trust / local-only**: a child stdio
+process of the trusted bot (one family, local machine), not a networked
+multi-tenant endpoint. Binding family to an authenticated session is post-diploma
+A2A work (see docs/SECURITY.md → "Граница доверия MCP-сервера").
+
 Run over stdio:  ``just mcp``  (or ``python -m family_finance.mcp_server.server``)
 """
 
@@ -18,6 +25,7 @@ import uuid
 import zoneinfo
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 
 from fastmcp import FastMCP
 
@@ -33,61 +41,93 @@ def _repo() -> PostgresTransactionRepository:
     return PostgresTransactionRepository()
 
 
-def _month_window(now: datetime | None = None) -> tuple[datetime, datetime]:
-    """Current Moscow calendar month [start, next-month-start)."""
-    now = now or datetime.now(_MOSCOW)
-    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    end = start.replace(year=start.year + (start.month // 12), month=(start.month % 12) + 1)
-    return start, end
-
-
 def _parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
 @mcp.tool
-async def aggregate_spending(
+async def query_aggregates(
     family_id: str,
-    categories: list[str],
-    directions: list[str],
+    group_by: Literal["day", "week", "month", "category", "merchant", "total"] = "total",
+    then_by: Literal["day", "week", "month", "category", "merchant"] | None = None,
+    categories: list[str] | None = None,
+    directions: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
-) -> dict[str, object]:
-    """Sum transactions for a family, scoped by categories/directions/period.
+    limit: int = 100,
+) -> list[dict[str, object]]:
+    """Flexible grouped sums — the main spending-query tool.
+
+    ``group_by`` chooses the dimension:
+    - ``total`` — one grand total for the whole filter (one row).
+    - ``day`` / ``week`` / ``month`` — time breakdown (Europe/Moscow calendar),
+      chronological. Use this for «по дням / помесячно».
+    - ``category`` / ``merchant`` — breakdown by category or merchant, biggest
+      first.
+
+    ``then_by`` adds a second dimension for a 2-D breakdown such as «по дням по
+    категориям» (``group_by="day", then_by="category"``); each row then also
+    carries a ``subbucket``.
 
     ``categories``/``directions`` are domain enum values (e.g. ``food.groceries``,
-    ``expense``). ``start``/``end`` are ISO-8601 datetimes; omit for all-time.
-    Returns ``{"total": "<rubles as string>", "count": <int>}``.
+    ``expense``); omit or pass ``[]`` for "all". ``start``/``end`` are ISO-8601
+    datetimes; omit for all-time. Returns a list of
+    ``{"bucket", "subbucket", "total", "count"}`` where ``bucket`` is the group
+    key as a string (date, ``YYYY-MM``, category value or merchant name) and
+    ``subbucket`` is ``None`` unless ``then_by`` is set.
     """
-    summary = await _repo().aggregate(
+    buckets = await _repo().query_aggregates(
         family_id=uuid.UUID(family_id),
-        categories=[Category(c) for c in categories],
-        directions=[Direction(d) for d in directions],
+        group_by=group_by,
+        then_by=then_by,
+        categories=[Category(c) for c in (categories or [])],
+        directions=[Direction(d) for d in (directions or [])],
         start=_parse_dt(start),
         end=_parse_dt(end),
+        limit=limit,
     )
-    return {"total": str(summary.total), "count": summary.count}
+    return [
+        {"bucket": b.bucket, "subbucket": b.subbucket, "total": str(b.total), "count": b.count}
+        for b in buckets
+    ]
 
 
 @mcp.tool
-async def spending_by_category(
+async def list_transactions(
     family_id: str,
+    categories: list[str] | None = None,
+    directions: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
+    order_by: Literal["date_desc", "amount_desc"] = "date_desc",
+    limit: int = 20,
 ) -> list[dict[str, object]]:
-    """Per-category expense totals for a period, biggest first.
+    """List individual transactions (not aggregated).
 
-    Defaults to the current Moscow calendar month when ``start``/``end`` are
-    omitted. Returns a list of ``{"category", "total", "count"}``.
+    Use for «покажи списком», «топ-5 крупных трат». ``order_by`` is
+    ``date_desc`` (newest first) or ``amount_desc`` (biggest first). Filters and
+    period behave like ``query_aggregates``. Returns a list of
+    ``{"occurred_at", "amount", "direction", "category", "merchant"}``.
     """
-    win_start = _parse_dt(start)
-    win_end = _parse_dt(end)
-    if win_start is None or win_end is None:
-        win_start, win_end = _month_window()
-    rows = await _repo().category_breakdown(
-        family_id=uuid.UUID(family_id), start=win_start, end=win_end
+    rows = await _repo().list_transactions(
+        family_id=uuid.UUID(family_id),
+        categories=[Category(c) for c in (categories or [])],
+        directions=[Direction(d) for d in (directions or [])],
+        start=_parse_dt(start),
+        end=_parse_dt(end),
+        order_by=order_by,
+        limit=limit,
     )
-    return [{"category": cat.value, "total": str(amount), "count": n} for cat, amount, n in rows]
+    return [
+        {
+            "occurred_at": e.occurred_at.isoformat(),
+            "amount": str(e.amount),
+            "direction": e.direction.value,
+            "category": e.category.value,
+            "merchant": e.merchant,
+        }
+        for e in rows
+    ]
 
 
 @mcp.tool

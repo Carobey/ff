@@ -17,7 +17,7 @@ from decimal import Decimal
 import structlog
 from langchain_core.messages import AIMessage
 
-from family_finance.agents.state import FinanceState
+from family_finance.agents.state import FinanceState, SectionResult
 from family_finance.domain import Subscription
 from family_finance.infrastructure.mcp import MCPLedgerReader
 
@@ -64,9 +64,33 @@ async def subscriptions_node(state: FinanceState) -> dict[str, object]:
     }
 
 
+async def build_subscriptions_section(family_id: uuid.UUID) -> SectionResult:
+    """Recurring-payments list — one orchestrator-worker section (ADR 0008).
+
+    Детектор подписок работает по всей истории (lookback ~год), периодом запроса
+    не ограничивается — поэтому period сюда не передаётся.
+    """
+    repo = MCPLedgerReader()
+    subs = await repo.detect_recurring(family_id=family_id)
+    body = format_subscriptions(subs) if subs else "📅 Регулярных трат за последний год не нашёл."
+    return {"kind": "subscriptions", "order": 3, "title": "Подписки", "body": body}
+
+
+_DAYS_PER_MONTH = Decimal("30")
+
+
+def _monthly_equivalent(sub: Subscription) -> Decimal:
+    """Привести трату к месячному эквиваленту: недельная ×~4, годовая ÷12.
+
+    Суммировать `average_amount` напрямую нельзя — у подписок разный cadence_days,
+    тогда «/мес» был бы арифметически неверным.
+    """
+    return sub.average_amount * _DAYS_PER_MONTH / Decimal(sub.cadence_days)
+
+
 def format_subscriptions(subs: list[Subscription]) -> str:
     """Render the detected subscriptions list as a Russian Telegram message."""
-    total_monthly = sum((s.average_amount for s in subs), Decimal("0"))
+    total_monthly = sum((_monthly_equivalent(s) for s in subs), Decimal("0"))
     lines = [f"📅 Нашёл регулярных трат: {len(subs)} (≈ {_money(total_monthly)} / мес)", ""]
     for sub in subs:
         amount = _money(sub.last_amount)
@@ -106,6 +130,10 @@ _ALERT_MIN_OCCURRENCES = 4
 # by at least this fraction (15% by default).
 _ALERT_AMOUNT_DELTA = Decimal("0.15")
 
+# Не заваливать пользователя — отдаём не больше этого числа алертов (самые
+# крупные по модулю изменения), остальное шумит.
+_ALERT_MAX_COUNT = 5
+
 
 async def detect_alerts(family_id: uuid.UUID) -> list[str]:
     """Return short, human-readable alert lines for subscriptions whose last
@@ -117,7 +145,7 @@ async def detect_alerts(family_id: uuid.UUID) -> list[str]:
     """
     repo = MCPLedgerReader()
     subs = await repo.detect_recurring(family_id=family_id)
-    alerts: list[str] = []
+    scored: list[tuple[Decimal, str]] = []
     for sub in subs:
         if sub.occurrences < _ALERT_MIN_OCCURRENCES:
             continue
@@ -127,9 +155,12 @@ async def detect_alerts(family_id: uuid.UUID) -> list[str]:
         if abs(delta) < _ALERT_AMOUNT_DELTA:
             continue
         direction = "подорожала" if delta > 0 else "подешевела"
-        alerts.append(
+        line = (
             f"⚠️ Подписка <b>{sub.merchant}</b> {direction}: "
             f"{_money(sub.last_amount)} вместо обычных {_money(sub.average_amount)} "
             f"({_pct_change(sub.last_amount, sub.average_amount):+.0f}%)"
         )
-    return alerts
+        scored.append((abs(delta), line))
+    # Самые крупные изменения первыми, остальное обрезаем — иначе шум.
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [line for _, line in scored[:_ALERT_MAX_COUNT]]

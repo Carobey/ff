@@ -9,12 +9,28 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
 # Алиас для читаемости. ПРАВИЛО: всегда Decimal, никогда float — float теряет точность.
 MoneyAmount = Decimal
+
+# Всё кроме букв/цифр (RU+EN) → пробел: убирает пунктуацию, номера терминалов, мусор.
+_MERCHANT_NOISE_RE = re.compile(r"[^0-9a-zа-я]+")
+
+
+def normalize_merchant(raw: str) -> str:
+    """Нормализовать строку продавца для fuzzy-поиска правил категоризации.
+
+    Pure-функция: lowercase, ё→е, пунктуация → пробел, схлопывание пробелов.
+    «Яндекс.Еда» → «яндекс еда», «ПЯТЕРОЧКА 1234 MOSCOW» → «пятерочка 1234 moscow».
+    Используется и при сиде правил, и при поиске, поэтому живёт в domain.
+    """
+    lowered = raw.lower().replace("ё", "е")
+    collapsed = _MERCHANT_NOISE_RE.sub(" ", lowered)
+    return " ".join(collapsed.split())
 
 
 def require_tz_aware(value: datetime) -> datetime:
@@ -72,10 +88,12 @@ class Category(StrEnum):
     FOOD_GROCERIES = "food.groceries"
     FOOD_RESTAURANT = "food.restaurant"
     FOOD_DELIVERY = "food.delivery"
+    FOOD_COFFEE = "food.coffee"
 
     # Транспорт
     TRANSPORT_FUEL = "transport.fuel"
     TRANSPORT_TAXI = "transport.taxi"
+    TRANSPORT_CARSHARE = "transport.carshare"
     TRANSPORT_PUBLIC = "transport.public"
     TRANSPORT_CARPARTS = "transport.carparts"
 
@@ -91,6 +109,8 @@ class Category(StrEnum):
 
     # Дом
     HOME_UTILITIES = "home.utilities"
+    HOME_TELECOM = "home.telecom"
+    HOME_RENT = "home.rent"
     HOME_FURNITURE = "home.furniture"
     HOME_REPAIR = "home.repair"
     HOME_HOUSEHOLD = "home.household"
@@ -98,12 +118,36 @@ class Category(StrEnum):
     # Здоровье (некомпенсируемое)
     HEALTH_PHARMACY = "health.pharmacy"
     HEALTH_GENERIC = "health.generic"
+    HEALTH_FITNESS = "health.fitness"
 
     # Развлечения
     ENTERTAINMENT_SUBS = "entertainment.subscriptions"
     ENTERTAINMENT_EVENTS = "entertainment.events"
     ENTERTAINMENT_HOBBIES = "entertainment.hobbies"
+    ENTERTAINMENT_GAMES = "entertainment.games"
 
+    # Красота и уход
+    BEAUTY_CARE = "beauty.care"
+
+    # Путешествия
+    TRAVEL_TICKETS = "travel.tickets"
+    TRAVEL_LODGING = "travel.lodging"
+
+    # Образование (без вычета)
+    EDUCATION_COURSES = "education.courses"
+
+    # Финансовые расходы
+    FINANCE_FEES = "finance.fees"
+    FINANCE_LOAN = "finance.loan"
+    FINANCE_INSURANCE = "finance.insurance"
+    FINANCE_CASH = "finance.cash"
+    FINANCE_INVESTMENT = "finance.investment"
+
+    # Госплатежи (налоги, штрафы, пошлины — НЕ вычеты)
+    GOVERNMENT_FEES = "government.fees"
+
+    GIFTS = "gifts"
+    CHARITY = "charity"
     PETS = "pets"
 
     # Налоговые вычеты — отдельный префикс для Phase 3 tax-агента (НК РФ)
@@ -120,6 +164,37 @@ class Category(StrEnum):
     # Спецслучаи
     TRANSFER_INTERNAL = "transfer.internal"  # между своими — НЕ расход
     UNCLASSIFIED = "unclassified"
+
+
+# Категории-подписки/регулярные счета. Детектор повторяющихся трат фильтрует по
+# ним, иначе любая еженедельная продуктовая корзина (Пятёрочка) или аптека едет
+# в «подписки». Стриминг/LLM/связь/интернет/ЖКХ/аренда/фитнес/страховка/кредит —
+# да; продукты/рестораны/аптека/розница/транспорт — нет.
+SUBSCRIPTION_CATEGORIES: frozenset[Category] = frozenset(
+    {
+        Category.ENTERTAINMENT_SUBS,
+        Category.HOME_TELECOM,
+        Category.HOME_UTILITIES,
+        Category.HOME_RENT,
+        Category.HEALTH_FITNESS,
+        Category.FINANCE_INSURANCE,
+        Category.FINANCE_LOAN,
+        Category.EDUCATION_COURSES,
+    }
+)
+
+
+def direction_for_category(category: Category) -> Direction:
+    """Доменное правило: знак операции выводится из категории.
+
+    Доходные категории → income, внутренний перевод → transfer, остальное → expense.
+    Используется, когда категорию назначает правило-справочник (а не парсер).
+    """
+    if category in (Category.INCOME_SALARY, Category.INCOME_OTHER):
+        return Direction.INCOME
+    if category == Category.TRANSFER_INTERNAL:
+        return Direction.TRANSFER
+    return Direction.EXPENSE
 
 
 class BankSource(StrEnum):

@@ -87,7 +87,7 @@ def parse_clarification_answers(
     """Parse numbered answers like `1 одежда 2 коммуналка`."""
     by_id = _questions_by_id(questions)
     answers: list[ClarificationAnswer] = []
-    for question_id, raw_label in _extract_numbered_answers(text):
+    for question_id, raw_label in _extract_numbered_answers(text, set(by_id)):
         question = by_id.get(question_id)
         if question is None:
             continue
@@ -104,6 +104,72 @@ def parse_clarification_answers(
             )
         )
     return answers
+
+
+# Ответы-«не знаю»: пользователь не может выбрать категорию → уходим в веб-поиск.
+# "__lookup__" — sentinel от inline-кнопки «🔎 Не знаю» (см. bot/handlers).
+_DONT_KNOW_TOKENS = (
+    "__lookup__",
+    "не знаю",
+    "незнаю",
+    "хз",
+    "не в курсе",
+    "понятия не имею",
+    "без понятия",
+    "не помню",
+    "найди",
+    "поищи",
+)
+
+
+def _is_dont_know(raw_label: str) -> bool:
+    normalized = raw_label.lower().replace("ё", "е").strip()
+    return any(token in normalized for token in _DONT_KNOW_TOKENS)
+
+
+def parse_unknown_answers(
+    text: str,
+    questions: list[ClarificationQuestion] | list[Any],
+) -> list[ClarificationQuestion]:
+    """Вернуть вопросы, на которые пользователь ответил «не знаю» (→ веб-поиск)."""
+    by_id = _questions_by_id(questions)
+    unknown: list[ClarificationQuestion] = []
+    seen: set[int] = set()
+    for question_id, raw_label in _extract_numbered_answers(text, set(by_id)):
+        if question_id in seen or not _is_dont_know(raw_label):
+            continue
+        question = by_id.get(question_id)
+        if question is not None:
+            unknown.append(question)
+            seen.add(question_id)
+    return unknown
+
+
+def parse_freetext_answers(
+    text: str,
+    questions: list[ClarificationQuestion] | list[Any],
+) -> list[tuple[ClarificationQuestion, str]]:
+    """Вернуть ответы свободным текстом (кнопки не подошли) → LLM-категоризация.
+
+    Это нумерованные ответы, чей текст НЕ известное ключевое слово и НЕ «не знаю»
+    (например «1 спортзал»). Их отдаём категоризатору поверх полной таксономии —
+    так ручной ввод работает, даже если ни одна кнопка не угадала.
+    """
+    by_id = _questions_by_id(questions)
+    result: list[tuple[ClarificationQuestion, str]] = []
+    seen: set[int] = set()
+    for question_id, raw_label in _extract_numbered_answers(text, set(by_id)):
+        if question_id in seen:
+            continue
+        question = by_id.get(question_id)
+        if question is None:
+            continue
+        # Уже обрабатывается другими ветками: точная категория или «не знаю».
+        if _is_dont_know(raw_label) or _classify_answer(raw_label) is not None:
+            continue
+        result.append((question, raw_label))
+        seen.add(question_id)
+    return result
 
 
 def _is_valid_question(value: object) -> TypeGuard[ClarificationQuestion]:
@@ -187,8 +253,13 @@ def _format_dates(dates: tuple[date, ...]) -> str:
     return f"даты: {shown}"
 
 
-def _extract_numbered_answers(text: str) -> list[tuple[int, str]]:
-    matches = list(re.finditer(r"(?:^|\s)(\d+)[\).]?\s+", text))
+def _extract_numbered_answers(text: str, valid_ids: set[int]) -> list[tuple[int, str]]:
+    # Only treat a number as a question marker when it matches a known question id.
+    # Otherwise an answer like "1 потратил 500 на еду" would split on 500 and
+    # truncate question 1's label to "потратил".
+    matches = [
+        m for m in re.finditer(r"(?:^|\s)(\d+)[\).]?\s+", text) if int(m.group(1)) in valid_ids
+    ]
     result: list[tuple[int, str]] = []
     for index, match in enumerate(matches):
         start = match.end()
@@ -211,7 +282,11 @@ def _classify_answer(raw_label: str) -> tuple[Category, Direction] | None:
     except ValueError:
         pass
 
-    # 2. Russian free-text fallback (typed answers)
+    # 2. Russian free-text fallback (typed answers).
+    # Намеренно отдельная таблица (см. подробный комментарий в ``ledger_terms``):
+    # ответ-уточнение → ОДНА (категория, направление). «магазин» здесь =
+    # SHOPPING_GENERIC (в ``budgets`` тот же токен ведёт в FOOD_GROCERIES) —
+    # конфликт интентов, поэтому таблицы не сливаются.
     normalized = raw_label.lower().replace("ё", "е")
     expense = Direction.EXPENSE
     if any(token in normalized for token in ("одежд", "шопинг")):

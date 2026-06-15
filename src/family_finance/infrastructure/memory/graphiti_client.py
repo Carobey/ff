@@ -53,6 +53,12 @@ _EMBED_DIM = 1536
 def _build_graphiti() -> Graphiti:
     """Build and cache a Graphiti instance connected to FalkorDB + OpenRouter.
 
+    NOTE: the cached instance holds an async client with no explicit close path —
+    it lives for the whole process. Acceptable for a long-running single-family
+    bot; if this ever becomes a short-lived/multi-tenant process, add a
+    ``close()`` lifecycle instead of ``lru_cache``.
+
+
     The underlying OpenAI client is ``langfuse.openai.AsyncOpenAI``, a drop-in
     instrumented replacement: same wire protocol, but every call emits a
     LangFuse generation span (cost, latency, prompt, completion). One shared

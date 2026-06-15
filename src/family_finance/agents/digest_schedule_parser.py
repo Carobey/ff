@@ -15,13 +15,15 @@ from __future__ import annotations
 from typing import Literal, cast
 
 import structlog
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableConfig
 from pydantic import BaseModel, Field
 
 from family_finance.domain import DigestSchedule
 from family_finance.infrastructure.llm import get_chat_model
+from family_finance.infrastructure.observability import make_callback_handler
 
 logger = structlog.get_logger()
 
@@ -65,9 +67,17 @@ async def parse_digest_schedule(text: str) -> DigestSchedule | None:
         "Runnable[LanguageModelInput, _ParsedSchedule]",
         get_chat_model(tier="worker").with_structured_output(_ParsedSchedule),
     )
+    config: RunnableConfig = {
+        "callbacks": cast("list[BaseCallbackHandler]", [make_callback_handler()]),
+        "metadata": {
+            "langfuse_tags": ["digest_schedule", "phase2"],
+            "langfuse_trace_name": "digest-schedule-parse",
+        },
+    }
     try:
         parsed = await model.ainvoke(
             [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=text)],
+            config=config,
         )
     except Exception:
         logger.exception("digest_schedule_parser_failed", text=text[:80])

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 import zoneinfo
 from datetime import datetime
@@ -20,12 +21,21 @@ from decimal import Decimal
 from typing import Literal
 
 import structlog
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool, tool
+from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, ConfigDict
 
-from family_finance.agents._messages import message_text
+from family_finance.agents._messages import message_text, recent_dialog
 from family_finance.agents.budgets import current_moscow_month
-from family_finance.agents.state import FinanceState
+from family_finance.agents.state import FinanceState, SectionResult
 from family_finance.domain import Category, Direction, GoalProgress, SavingsGoal
 from family_finance.infrastructure.llm import get_chat_model
 from family_finance.infrastructure.mcp import MCPLedgerReader
@@ -53,12 +63,19 @@ _NEEDS: frozenset[Category] = frozenset(
         Category.KIDS_CLOTHES,
         Category.KIDS_SCHOOL,
         Category.HOME_UTILITIES,
+        Category.HOME_TELECOM,
+        Category.HOME_RENT,
         Category.HOME_HOUSEHOLD,
         Category.HOME_REPAIR,
         Category.HEALTH_PHARMACY,
         Category.HEALTH_GENERIC,
         Category.TAX_DED_MEDICAL,
         Category.TAX_DED_EDUCATION,
+        Category.EDUCATION_COURSES,
+        Category.FINANCE_FEES,
+        Category.FINANCE_LOAN,
+        Category.FINANCE_INSURANCE,
+        Category.GOVERNMENT_FEES,
     }
 )
 
@@ -75,8 +92,17 @@ _WANTS: frozenset[Category] = frozenset(
         Category.ENTERTAINMENT_SUBS,
         Category.ENTERTAINMENT_EVENTS,
         Category.ENTERTAINMENT_HOBBIES,
+        Category.ENTERTAINMENT_GAMES,
         Category.PETS,
         Category.TAX_DED_SPORT,
+        Category.TRANSPORT_CARSHARE,
+        Category.BEAUTY_CARE,
+        Category.TRAVEL_TICKETS,
+        Category.TRAVEL_LODGING,
+        Category.GIFTS,
+        Category.FOOD_COFFEE,
+        Category.HEALTH_FITNESS,
+        Category.CHARITY,
     }
 )
 
@@ -152,6 +178,7 @@ _ADVICE_TOKENS = (
     "оптимизир",
     "урезать",
     "подушк",
+    "рекоменд",
 )
 
 
@@ -182,24 +209,132 @@ _ADVISOR_SYSTEM = """\
 """
 
 
+_ADVISOR_REACT_SYSTEM = """\
+Ты — финансовый наставник семьи. Помогаешь экономить и копить.
+
+У тебя есть инструменты, которые отдают УЖЕ ПОСЧИТАННЫЕ цифры по этой семье:
+- spending_health_503020 — разбивка текущего месяца по правилу 50/30/20
+  (доход, нужды, желания, накопления и их проценты).
+- largest_discretionary — крупнейшие категории «желаний», кандидаты на сокращение.
+- savings_goal_status — статус цели накопления (сколько накоплено, сколько в месяц).
+
+Методики (выбери под вопрос):
+- 50/30/20: нужды ≤50%, желания ≤30%, накопления ≥20% от дохода. Для вопросов
+  «куда уходят деньги», «на чём сэкономить».
+- Pay-yourself-first: откладывай в начале месяца, до трат; подушка = 3-6 месяцев
+  расходов. Для вопросов про накопления и цель.
+
+ПРАВИЛА:
+- Сначала вызови нужные инструменты, чтобы узнать реальные цифры. Используй ТОЛЬКО
+  эти данные — НИКОГДА не выдумывай суммы и проценты.
+- Дёргай ровно те инструменты, что нужны под вопрос; не вызывай лишние.
+- Итог — 3-5 предложений по-русски, суммы с пробелами между тысячами («12 300 ₽»).
+- Дай 1-2 конкретных действия: что сократить и/или сколько откладывать.
+- Ты НЕ лицензированный финансовый советник — это бытовые рекомендации по личному
+  бюджету, без инвестиционных советов.
+"""
+
+
+def _build_advisor_tools(
+    family_id: uuid.UUID,
+    *,
+    repo: MCPLedgerReader,
+    now: datetime,
+    health: SpendingHealth,
+    goal: SavingsGoal | None,
+) -> list[BaseTool]:
+    """ReAct-инструменты наставника. ``family_id`` зашит в замыкание — LLM никогда
+    не видит UUID семьи и не может запросить чужие данные (см. security-слой).
+
+    ``health``/``goal`` уже посчитаны гейтом ``advisor_node`` — переиспользуем их,
+    чтобы не дёргать те же SQL-агрегаты второй раз на каждый совет (PR-02).
+    """
+
+    @tool
+    async def spending_health_503020() -> str:
+        """Разбивка трат семьи за текущий месяц по правилу 50/30/20."""
+        if not health.has_income:
+            return (
+                f"Доход за месяц не зафиксирован. Нужды: {_money(health.needs)}, "
+                f"желания: {_money(health.wants)}. Процент накоплений посчитать нельзя."
+            )
+        return (
+            f"Доход: {_money(health.income)}. "
+            f"Нужды: {_money(health.needs)} ({health.needs_pct}%, норма ≤{_NEEDS_NORM}%). "
+            f"Желания: {_money(health.wants)} ({health.wants_pct}%, норма ≤{_WANTS_NORM}%). "
+            f"Накопления: {_money(health.savings)} "
+            f"({health.savings_pct}%, норма ≥{_SAVINGS_NORM}%)."
+        )
+
+    @tool
+    async def largest_discretionary() -> str:
+        """Крупнейшие категории «желаний» за месяц — кандидаты на сокращение."""
+        cut = await _top_wants(family_id, repo=repo, now=now)
+        if not cut:
+            return "Заметных трат на «желания» в этом месяце нет."
+        return "Крупнейшие желания: " + "; ".join(
+            f"{cat.value} — {_money(amount)}" for cat, amount in cut
+        )
+
+    @tool
+    async def savings_goal_status() -> str:
+        """Статус цели накопления: сколько накоплено и сколько нужно в месяц."""
+        if goal is None:
+            return "Цель накопления не задана."
+        progress = await _goal_progress(goal, repo=repo, now=now)
+        return _goal_facts(progress, now)
+
+    return [spending_health_503020, largest_discretionary, savings_goal_status]
+
+
+# ── Self-critique: заземление чисел (детерминированное) ───────────────────────
+
+# Денежная сумма в тексте: цифры (возможно с пробелами-разделителями тысяч) + ₽.
+_MONEY_RE = re.compile(r"\d[\d   ]*\s*₽")
+
+
+def _money_figures(text: str) -> set[str]:
+    """Денежные суммы во ``text``, нормализованные до одних цифр («12 300 ₽» → ``12300``)."""
+    return {re.sub(r"\D", "", token) for token in _MONEY_RE.findall(text)}
+
+
+def _assert_grounded(reply: str, trace: list[BaseMessage]) -> None:
+    """Само-критика ответа наставника: каждая ₽-сумма обязана прийти из инструмента.
+
+    Инструменты возвращают ПОСЧИТАННЫЕ Python-ом числа (ground truth) — собираем их
+    из ``ToolMessage``-ей ReAct-трейса. Любая сумма в ответе, которой там нет, —
+    выдумана LLM (нарушение «Python считает»); поднимаем ошибку → тот же
+    детерминированный fallback на известных числах, что и при сбое модели, вместо
+    отправки галлюцинации пользователю.
+    """
+    grounded: set[str] = set()
+    for message in trace:
+        if isinstance(message, ToolMessage):
+            grounded |= _money_figures(message_text(message))
+    invented = _money_figures(reply) - grounded
+    if invented:
+        raise ValueError(f"ungrounded figures in advisor reply: {sorted(invented)}")
+
+
 async def advisor_node(state: FinanceState) -> dict[str, object]:
-    """Give grounded saving/cutting advice for the family."""
-    last_human = next(
-        (m for m in reversed(state.get("messages", [])) if isinstance(m, HumanMessage)),
-        None,
-    )
-    user_text = str(last_human.content) if last_human else ""
+    """Give grounded saving/cutting advice via a ReAct loop over Python-computed tools.
+
+    Цифры считает Python (инструменты), LLM лишь решает, что спросить, и оборачивает
+    результат в человеческий совет («LLM формулирует/маршрутизирует, Python считает»).
+    Маскирование PII сохраняется — ReAct ходит через ``MaskingChatModel``.
+
+    Перед отправкой — само-критика (``_assert_grounded``): каждая ₽-сумма в ответе
+    сверяется с числами из инструментов; выдуманная сумма → детерминированный
+    fallback вместо галлюцинации.
+    """
     family_id = uuid.UUID(state["family_id"])
     repo = MCPLedgerReader()
     now = datetime.now(tz=_MOSCOW)
 
+    # Гейт без LLM: совсем нет данных → честный детерминированный ответ, не гоняем
+    # ReAct-цикл впустую.
     health = await analyze_spending(family_id, repo=repo, now=now)
-    cut_candidates = await _top_wants(family_id, repo=repo, now=now)
     goal = await repo.get_savings_goal(family_id=family_id)
-    progress: GoalProgress | None = None
-    if goal is not None:
-        progress = await _goal_progress(goal, repo=repo, now=now)
-
     if not health.has_income and health.total_expenses == 0 and goal is None:
         return {
             "messages": [
@@ -214,20 +349,86 @@ async def advisor_node(state: FinanceState) -> dict[str, object]:
             "current_intent": "idle",
         }
 
-    facts = _build_facts(user_text, health, cut_candidates, progress, now)
+    tools = _build_advisor_tools(family_id, repo=repo, now=now, health=health, goal=goal)
     try:
-        model = get_chat_model(tier="worker")
-        response = await model.ainvoke(
-            [SystemMessage(content=_ADVISOR_SYSTEM), HumanMessage(content=facts)],
+        agent = create_react_agent(
+            get_chat_model(tier="worker"),
+            tools,
+            prompt=_ADVISOR_REACT_SYSTEM,
         )
-        reply = message_text(response).strip()
+        config: RunnableConfig = {"recursion_limit": 10}
+        result = await agent.ainvoke(
+            {"messages": recent_dialog(state.get("messages", []))},
+            config=config,
+        )
+        reply = message_text(result["messages"][-1]).strip()
+        if not reply:
+            raise ValueError("empty advisor reply")
+        _assert_grounded(reply, result["messages"])
     except Exception:
-        logger.exception("advisor_llm_failed")
+        logger.exception("advisor_react_failed")
+        progress = await _goal_progress(goal, repo=repo, now=now) if goal is not None else None
         reply = _fallback(health, progress, now)
 
     return {
         "messages": [AIMessage(content=reply)],
         "current_intent": "idle",
+    }
+
+
+# ── Orchestrator section (ADR 0008) ───────────────────────────────────────────
+
+
+async def build_advice_section(
+    family_id: uuid.UUID,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    now: datetime | None = None,
+) -> SectionResult:
+    """Saving/cutting recommendations for ``period`` — one orchestrator section.
+
+    50/30/20-числа считаются в Python (как и в ``advisor_node``); LLM лишь
+    оборачивает их в текст. Сбой LLM / нет данных → детерминированный fallback.
+
+    Почему НЕ ReAct (в отличие от ``advisor_node``): это section-воркер веера
+    мульти-интента (ADR 0008) — его дёргают параллельно через ``Send`` с фикс.
+    периодом, а результат склеивает синтезатор. Путь обязан быть детерминированным
+    и одно-проходным (один LLM-вызов на known facts), без свободного tool-цикла:
+    предсказуемая латентность и форма ответа для join'а. Одиночный интент «дай
+    совет» идёт через ``advisor_node`` (ReAct, сам выбирает инструменты). Расхожд.
+    голоса между путями — осознанный trade-off (PR-03); оба под eval.
+    """
+    now = now or datetime.now(tz=_MOSCOW)
+    period = (start, end) if start is not None and end is not None else None
+    repo = MCPLedgerReader()
+
+    health = await analyze_spending(family_id, repo=repo, now=now, period=period)
+    cut_candidates = await _top_wants(family_id, repo=repo, now=now, period=period)
+    goal = await repo.get_savings_goal(family_id=family_id)
+    progress = await _goal_progress(goal, repo=repo, now=now) if goal is not None else None
+
+    if not health.has_income and health.total_expenses == 0 and goal is None:
+        body = "Недостаточно данных для рекомендаций — загрузи выписку банка."
+    else:
+        facts = _build_facts(
+            "Дай рекомендации, на чём сэкономить.", health, cut_candidates, progress, now
+        )
+        try:
+            model = get_chat_model(tier="worker")
+            response = await model.ainvoke(
+                [SystemMessage(content=_ADVISOR_SYSTEM), HumanMessage(content=facts)],
+            )
+            body = message_text(response).strip()
+        except Exception:
+            logger.exception("advice_section_llm_failed")
+            body = _fallback(health, progress, now)
+
+    return {
+        "kind": "advice",
+        "order": 4,
+        "title": "Рекомендации",
+        "body": f"💡 <b>Рекомендации</b>\n{body}",
     }
 
 
@@ -239,9 +440,10 @@ async def analyze_spending(
     *,
     repo: MCPLedgerReader,
     now: datetime,
+    period: tuple[datetime, datetime] | None = None,
 ) -> SpendingHealth:
-    """Compute the 50/30/20 split for the current Moscow month."""
-    start, end = current_moscow_month(now)
+    """Compute the 50/30/20 split for ``period`` (default: current Moscow month)."""
+    start, end = period if period is not None else current_moscow_month(now)
     breakdown = await repo.category_breakdown(family_id=family_id, start=start, end=end)
     income = (
         await repo.aggregate(
@@ -272,9 +474,10 @@ async def _top_wants(
     repo: MCPLedgerReader,
     now: datetime,
     limit: int = 3,
+    period: tuple[datetime, datetime] | None = None,
 ) -> list[tuple[Category, Decimal]]:
-    """Largest discretionary ('wants') categories this month — cut candidates."""
-    start, end = current_moscow_month(now)
+    """Largest discretionary ('wants') categories in ``period`` — cut candidates."""
+    start, end = period if period is not None else current_moscow_month(now)
     breakdown = await repo.category_breakdown(family_id=family_id, start=start, end=end)
     wants = [(cat, amount) for cat, amount, _ in breakdown if bucket_of(cat) == "wants"]
     return wants[:limit]

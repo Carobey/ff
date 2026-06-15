@@ -42,17 +42,21 @@ class MCPLedgerReader:
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> LedgerSummary:
-        data = await call_finance_tool(
-            "aggregate_spending",
+        rows = await call_finance_tool(
+            "query_aggregates",
             {
                 "family_id": str(family_id),
+                "group_by": "total",
                 "categories": [c.value for c in categories],
                 "directions": [d.value for d in directions],
                 "start": start.isoformat() if start else None,
                 "end": end.isoformat() if end else None,
             },
         )
-        return LedgerSummary(total=Decimal(str(data["total"])), count=int(data["count"]))
+        if not rows:
+            return LedgerSummary(total=Decimal("0"), count=0)
+        row = rows[0]
+        return LedgerSummary(total=Decimal(str(row["total"])), count=int(row["count"]))
 
     async def category_breakdown(
         self,
@@ -62,10 +66,16 @@ class MCPLedgerReader:
         end: datetime,
     ) -> list[tuple[Category, Decimal, int]]:
         rows = await call_finance_tool(
-            "spending_by_category",
-            {"family_id": str(family_id), "start": start.isoformat(), "end": end.isoformat()},
+            "query_aggregates",
+            {
+                "family_id": str(family_id),
+                "group_by": "category",
+                "directions": [Direction.EXPENSE.value],
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            },
         )
-        return [(Category(r["category"]), Decimal(str(r["total"])), int(r["count"])) for r in rows]
+        return [(Category(r["bucket"]), Decimal(str(r["total"])), int(r["count"])) for r in rows]
 
     async def get_savings_goal(self, *, family_id: uuid.UUID) -> SavingsGoal | None:
         data = await call_finance_tool("savings_goal", {"family_id": str(family_id)})

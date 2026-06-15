@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import date, datetime
 from decimal import Decimal
 
 import asyncpg
 
-from family_finance.application.ports import LedgerSummary
+from family_finance.application.ports import LedgerBucket, LedgerEntry, LedgerSummary
 from family_finance.domain import (
+    SUBSCRIPTION_CATEGORIES,
     Budget,
     BudgetStatus,
     Category,
@@ -46,6 +48,62 @@ async def _get_pool(dsn: str) -> asyncpg.Pool:
             )
             _pools[dsn] = pool
         return pool
+
+
+@contextlib.asynccontextmanager
+async def loop_local_pool(dsn: str | None = None) -> AsyncIterator[asyncpg.Pool]:
+    """Bind a fresh pool on the *current* event loop, bypassing the shared cache.
+
+    For offline runners that drive each task on a throwaway loop (the LangFuse
+    eval ``experiment`` — each ``run_experiment`` runs in its own thread+loop):
+    the process-wide cached pool would be bound to an already-closed loop and
+    raise «connection was closed» / «another operation is in progress». This
+    installs a pool tied to the running loop for the block, then restores the
+    cache. Safe only for serial use of *dsn* (the eval runner pins cascade to
+    ``max_concurrency=1``); the long-lived bot keeps using ``_get_pool``.
+    """
+    resolved = dsn or get_settings().database_url.get_secret_value()
+    pool = await asyncpg.create_pool(dsn=resolved, min_size=1, max_size=2, command_timeout=30)
+    previous = _pools.get(resolved)
+    _pools[resolved] = pool
+    try:
+        yield pool
+    finally:
+        if previous is not None:
+            _pools[resolved] = previous
+        else:
+            _pools.pop(resolved, None)
+        await pool.close()
+
+
+# ── Whitelisted SQL fragments for the flexible query tools ───────────────────
+# group_by / order_by come from a closed enum and map to FIXED SQL expressions
+# here. Nothing user-supplied is ever interpolated — keeps "safe fixed SQL".
+# Time buckets use Europe/Moscow local dates so "по дням" matches the user's
+# calendar, not UTC.
+_AGG_BUCKET_SQL: dict[str, str] = {
+    "day": "to_char((occurred_at AT TIME ZONE 'Europe/Moscow')::date, 'YYYY-MM-DD')",
+    "week": (
+        "to_char(date_trunc('week', occurred_at AT TIME ZONE 'Europe/Moscow')::date, 'YYYY-MM-DD')"
+    ),
+    "month": "to_char((occurred_at AT TIME ZONE 'Europe/Moscow')::date, 'YYYY-MM')",
+    "category": "category",
+    "merchant": "COALESCE(NULLIF(merchant_raw, ''), '(без продавца)')",
+    "total": "'total'",
+}
+# Category/merchant → biggest first; time buckets → chronological.
+_AGG_ORDER_SQL: dict[str, str] = {
+    "day": "bucket ASC",
+    "week": "bucket ASC",
+    "month": "bucket ASC",
+    "category": "total_num DESC",
+    "merchant": "total_num DESC",
+    "total": "bucket ASC",
+}
+_LIST_ORDER_SQL: dict[str, str] = {
+    "date_desc": "occurred_at DESC",
+    "amount_desc": "amount DESC",
+}
 
 
 class PostgresTransactionRepository:
@@ -196,6 +254,181 @@ class PostgresTransactionRepository:
         if row is None:
             return LedgerSummary(total=Decimal("0"), count=0)
         return LedgerSummary(total=Decimal(row["total"]), count=row["count"])
+
+    async def query_aggregates(
+        self,
+        *,
+        family_id: uuid.UUID,
+        group_by: str,
+        then_by: str | None = None,
+        categories: Sequence[Category] = (),
+        directions: Sequence[Direction] = (),
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+    ) -> list[LedgerBucket]:
+        """Grouped sums over a flexible dimension. See port docstring.
+
+        ``group_by``/``then_by`` are validated against a fixed whitelist before
+        they touch SQL, so the resulting query is still fully parameterised +
+        fixed-shape. Empty ``categories``/``directions`` → no filter on that
+        column. When ``then_by`` is set, the query groups by two dimensions and
+        each row carries a ``subbucket``.
+        """
+        bucket_expr = _AGG_BUCKET_SQL.get(group_by)
+        order_expr = _AGG_ORDER_SQL.get(group_by)
+        if bucket_expr is None or order_expr is None:
+            raise ValueError(f"unsupported group_by: {group_by!r}")
+
+        cat_filter = [c.value for c in categories] or None
+        dir_filter = [d.value for d in directions] or None
+        safe_limit = max(1, min(int(limit), 1000))
+
+        # bucket_expr/order_expr are whitelisted fragments (see _AGG_*_SQL); every
+        # value below is a bound parameter ($1..$6) — no user input is interpolated.
+        if then_by is not None:
+            return await self._query_aggregates_2d(
+                family_id=family_id,
+                bucket_expr=bucket_expr,
+                then_by=then_by,
+                cat_filter=cat_filter,
+                dir_filter=dir_filter,
+                start=start,
+                end=end,
+                safe_limit=safe_limit,
+            )
+
+        sql = f"""
+            SELECT
+                {bucket_expr} AS bucket,
+                COALESCE(SUM(amount), 0)::TEXT AS total,
+                COALESCE(SUM(amount), 0) AS total_num,
+                COUNT(*) AS count
+            FROM "transaction"
+            WHERE family_id = $1
+              AND ($2::TEXT[] IS NULL OR category = ANY($2::TEXT[]))
+              AND ($3::TEXT[] IS NULL OR direction = ANY($3::TEXT[]))
+              AND ($4::TIMESTAMPTZ IS NULL OR occurred_at >= $4)
+              AND ($5::TIMESTAMPTZ IS NULL OR occurred_at < $5)
+            GROUP BY bucket
+            ORDER BY {order_expr}
+            LIMIT $6
+        """
+        pool = await _get_pool(self._dsn)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, family_id, cat_filter, dir_filter, start, end, safe_limit)
+        return [
+            LedgerBucket(
+                bucket=str(row["bucket"]),
+                total=Decimal(row["total"]),
+                count=row["count"],
+            )
+            for row in rows
+        ]
+
+    async def _query_aggregates_2d(
+        self,
+        *,
+        family_id: uuid.UUID,
+        bucket_expr: str,
+        then_by: str,
+        cat_filter: list[str] | None,
+        dir_filter: list[str] | None,
+        start: datetime | None,
+        end: datetime | None,
+        safe_limit: int,
+    ) -> list[LedgerBucket]:
+        """Two-dimensional grouped sums (``group_by`` + ``then_by``).
+
+        Rows come back ordered by primary bucket ascending, then by amount
+        descending inside each bucket — so «по дням по категориям» reads as
+        chronological days with the biggest category first.
+        """
+        sub_expr = _AGG_BUCKET_SQL.get(then_by)
+        if sub_expr is None:
+            raise ValueError(f"unsupported then_by: {then_by!r}")
+
+        # bucket_expr/sub_expr are whitelisted fragments; filters are bound params.
+        sql = f"""
+            SELECT
+                {bucket_expr} AS bucket,
+                {sub_expr} AS subbucket,
+                COALESCE(SUM(amount), 0)::TEXT AS total,
+                COUNT(*) AS count
+            FROM "transaction"
+            WHERE family_id = $1
+              AND ($2::TEXT[] IS NULL OR category = ANY($2::TEXT[]))
+              AND ($3::TEXT[] IS NULL OR direction = ANY($3::TEXT[]))
+              AND ($4::TIMESTAMPTZ IS NULL OR occurred_at >= $4)
+              AND ($5::TIMESTAMPTZ IS NULL OR occurred_at < $5)
+            GROUP BY bucket, subbucket
+            ORDER BY bucket ASC, COALESCE(SUM(amount), 0) DESC
+            LIMIT $6
+        """
+        pool = await _get_pool(self._dsn)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, family_id, cat_filter, dir_filter, start, end, safe_limit)
+        return [
+            LedgerBucket(
+                bucket=str(row["bucket"]),
+                subbucket=str(row["subbucket"]),
+                total=Decimal(row["total"]),
+                count=row["count"],
+            )
+            for row in rows
+        ]
+
+    async def list_transactions(
+        self,
+        *,
+        family_id: uuid.UUID,
+        categories: Sequence[Category] = (),
+        directions: Sequence[Direction] = (),
+        start: datetime | None = None,
+        end: datetime | None = None,
+        order_by: str = "date_desc",
+        limit: int = 20,
+    ) -> list[LedgerEntry]:
+        """Raw transaction rows, newest-first or biggest-first (``order_by``)."""
+        order_expr = _LIST_ORDER_SQL.get(order_by)
+        if order_expr is None:
+            raise ValueError(f"unsupported order_by: {order_by!r}")
+
+        cat_filter = [c.value for c in categories] or None
+        dir_filter = [d.value for d in directions] or None
+        safe_limit = max(1, min(int(limit), 200))
+
+        # order_expr is a whitelisted fragment (see _LIST_ORDER_SQL); all filter
+        # values are bound parameters ($1..$6) — nothing user-supplied interpolated.
+        sql = f"""
+            SELECT
+                occurred_at,
+                amount::TEXT AS amount,
+                direction,
+                category,
+                COALESCE(merchant_raw, '') AS merchant
+            FROM "transaction"
+            WHERE family_id = $1
+              AND ($2::TEXT[] IS NULL OR category = ANY($2::TEXT[]))
+              AND ($3::TEXT[] IS NULL OR direction = ANY($3::TEXT[]))
+              AND ($4::TIMESTAMPTZ IS NULL OR occurred_at >= $4)
+              AND ($5::TIMESTAMPTZ IS NULL OR occurred_at < $5)
+            ORDER BY {order_expr}
+            LIMIT $6
+        """
+        pool = await _get_pool(self._dsn)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, family_id, cat_filter, dir_filter, start, end, safe_limit)
+        return [
+            LedgerEntry(
+                occurred_at=row["occurred_at"],
+                amount=Decimal(row["amount"]),
+                direction=Direction(row["direction"]),
+                category=Category(row["category"]),
+                merchant=row["merchant"],
+            )
+            for row in rows
+        ]
 
     async def classify_by_import_hashes(
         self,
@@ -553,6 +786,8 @@ class PostgresTransactionRepository:
           * average inter-payment gap within ``[min_cadence_days, max_cadence_days]``
             (default 20..45 days ≈ monthly)
           * direction = EXPENSE only
+          * category in ``SUBSCRIPTION_CATEGORIES`` — иначе еженедельная продуктовая
+            корзина (Пятёрочка) или аптека ловятся как «подписка» (QA-03)
 
         Returns a list of :class:`Subscription` value objects, newest-seen first.
         """
@@ -574,6 +809,7 @@ class PostgresTransactionRepository:
                     WHERE family_id = $1
                       AND direction = 'expense'
                       AND occurred_at >= NOW() - make_interval(days => $3)
+                      AND category = ANY($6::text[])
                 ),
                 summary AS (
                     SELECT
@@ -600,6 +836,7 @@ class PostgresTransactionRepository:
                 lookback_days,
                 min_cadence_days,
                 max_cadence_days,
+                [c.value for c in SUBSCRIPTION_CATEGORIES],
             )
 
         return [

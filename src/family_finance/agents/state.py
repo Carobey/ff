@@ -44,6 +44,22 @@ def replace_open_questions(
     return new
 
 
+def accumulate_sections(
+    existing: list[SectionResult] | None,
+    new: list[SectionResult],
+) -> list[SectionResult]:
+    """Fan-in reducer for the orchestrator-worker веер (ADR 0008).
+
+    Каждый воркер пишет одну секцию — они накапливаются в одном суперстепе
+    (``operator.add``-семантика). Пустой апдейт ``[]`` от планировщика —
+    сигнал «начать новую партию»: сбрасывает остаток прошлого мульти-запроса,
+    иначе секции копились бы между ходами диалога (state checkpoint-ится).
+    """
+    if not new:
+        return []
+    return (existing or []) + list(new)
+
+
 # === Intent (для routing supervisor'ом) ===
 
 Intent = Literal[
@@ -54,9 +70,24 @@ Intent = Literal[
     "subscriptions",  # запрос списка подписок / регулярных трат
     "budgets",  # запрос состояния бюджетов
     "advice",  # совет наставника: экономия / накопления (50/30/20, PYF)
+    "tax",  # оценка возврата НДФЛ по социальным вычетам (ст. 219 НК)
+    "multi",  # мульти-интентный запрос → веер воркеров + синтез (ADR 0008)
     "clarify",  # ответ на уточняющий вопрос бота
     "idle",  # нечего делать
 ]
+
+
+class SectionResult(TypedDict):
+    """Готовая секция ответа от одного воркера (orchestrator-worker, ADR 0008).
+
+    ``body`` уже отрендерен детерминированно в Python (числа не от LLM);
+    ``order`` задаёт порядок в синтезе (порядок прихода ``Send`` не гарантирован).
+    """
+
+    kind: str
+    order: int
+    title: str
+    body: str
 
 
 # === Главный state ===
@@ -94,5 +125,9 @@ class FinanceState(TypedDict, total=False):
     next_agent: str
     ingest_ok: bool  # ingest_node → gates the ingest→categorizer branch
 
-    # Дебаг
-    last_supervisor_reasoning: str | None
+    # Orchestrator-worker (мульти-интент, ADR 0008)
+    plan: list[str]  # секции для веера: ["spending", "budgets", ...]
+    period_start: str | None  # ISO; общий период, распарсенный планировщиком один раз
+    period_end: str | None
+    period_label: str
+    section_results: Annotated[list[SectionResult], accumulate_sections]

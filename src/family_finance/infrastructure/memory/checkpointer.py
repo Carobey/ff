@@ -17,10 +17,30 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
+from family_finance.domain import (
+    Category,
+    Currency,
+    Direction,
+    Transaction,
+    TransactionSource,
+)
 from family_finance.infrastructure.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Доменные типы, которые попадают в state (`parsed_transactions`) и, значит,
+# сериализуются в чекпойнт. LangGraph 1.2+ требует явно разрешать кастомные
+# типы при десериализации (иначе — deprecation warning, в будущем — блокировка).
+# Stdlib-типы (Decimal, datetime, UUID) уже в SAFE_MSGPACK_TYPES — их не перечисляем.
+_ALLOWED_CHECKPOINT_TYPES = (
+    Transaction,
+    Category,
+    Currency,
+    Direction,
+    TransactionSource,
+)
 
 
 @asynccontextmanager
@@ -38,7 +58,12 @@ async def get_checkpointer() -> AsyncIterator[AsyncPostgresSaver]:
     conn_string = s.database_url.get_secret_value()
     logger.info("Connecting checkpointer: %s", conn_string.split("@")[-1])
 
-    async with AsyncPostgresSaver.from_conn_string(conn_string) as saver:
+    serde = JsonPlusSerializer(allowed_msgpack_modules=_ALLOWED_CHECKPOINT_TYPES)
+    async with AsyncPostgresSaver.from_conn_string(conn_string, serde=serde) as saver:
         await saver.setup()  # создаёт таблицы checkpointer'а если их нет
-        logger.info("✅ PostgresSaver ready")
+        logger.info(
+            "✅ PostgresSaver ready (msgpack allowlist: %d custom types: %s)",
+            len(_ALLOWED_CHECKPOINT_TYPES),
+            ", ".join(t.__name__ for t in _ALLOWED_CHECKPOINT_TYPES),
+        )
         yield saver
