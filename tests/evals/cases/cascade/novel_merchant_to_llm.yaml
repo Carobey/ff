@@ -1,0 +1,11 @@
+id: casc_002
+agent: cascade
+description: "Неизвестный продавец → промах по правилам, уходит в LLM"
+tags: [cascade, miss, llm, prompt-v1]
+input:
+  merchant_raw: "ООО РОГА И КОПЫТА 7777 NSK"
+expected:
+  rule_hit: false
+scorers:
+  - type: exact_match
+    field: rule_hit

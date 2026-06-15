@@ -1,0 +1,18 @@
+id: casc_003
+agent: cascade
+description: "Обучение: ответ пользователя становится правилом семьи (source=user)"
+tags: [cascade, learning-loop, demo, prompt-v1]
+input:
+  merchant_raw: "СТУДИЯ ЙОГИ АУМ"
+  learn_category: entertainment.hobbies
+expected:
+  rule_hit: true
+  category: entertainment.hobbies
+  source: user
+scorers:
+  - type: exact_match
+    field: rule_hit
+  - type: exact_match
+    field: category
+  - type: exact_match
+    field: source

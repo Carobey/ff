@@ -17,17 +17,21 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 import pytest
 import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict
 
-from family_finance.agents.categorizer import CATEGORIZER_SYSTEM, CategoryPrediction
+from family_finance.agents.categorizer import CategoryPrediction, build_system_prompt
 from family_finance.agents.supervisor import route_after_supervisor, supervisor_node
 from family_finance.domain import Category, Direction, Transaction, TransactionSource
 from family_finance.infrastructure.llm import get_chat_model
 from family_finance.infrastructure.parsers import TinkoffCsvParser
+from family_finance.infrastructure.persistence import PostgresCategoryCatalog
 from family_finance.infrastructure.security import check_injection
+from family_finance.infrastructure.settings import get_settings
+from tests.evals.cascade_task import run_cascade
 from tests.evals.scorers import apply_scorer
 
 # ── LLM-as-judge scorer ───────────────────────────────────────────────────────
@@ -61,6 +65,36 @@ async def _llm_judge_category(merchant_raw: str, predicted_category: str) -> flo
     return 1.0 if verdict.reasonable else 0.0
 
 
+class _PlanJudge(BaseModel):
+    """Verdict of the LLM-judge on whether a section plan fits a query."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reasonable: bool
+    reason: str = ""
+
+
+_PLAN_JUDGE_SYSTEM = (
+    "Ты — судья качества планировщика финансового помощника. Тебе дают запрос "
+    "пользователя и НАБОР разделов, который выбрал планировщик: spending (траты), "
+    "budgets (бюджеты), subscriptions (подписки), advice (советы как экономить). "
+    "Верни reasonable=true, если набор разделов разумно покрывает запрос (ничего "
+    "важного не упущено и нет явно лишнего), иначе reasonable=false."
+)
+
+
+async def _llm_judge_plan(user_text: str, plan: list[str]) -> float:
+    """LLM-as-judge: 1.0 if the chosen section set reasonably covers the query."""
+    model = get_chat_model(tier="worker").with_structured_output(_PlanJudge)
+    verdict: _PlanJudge = await model.ainvoke(  # type: ignore[assignment]
+        [
+            SystemMessage(content=_PLAN_JUDGE_SYSTEM),
+            HumanMessage(content=f"Запрос: {user_text}\nРазделы: {plan}"),
+        ],
+    )
+    return 1.0 if verdict.reasonable else 0.0
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 EVAL_FAMILY_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -70,6 +104,35 @@ CASES_DIR = Path(__file__).parent / "cases"
 
 def _load_cases(agent: str) -> list[Path]:
     return sorted((CASES_DIR / agent).glob("*.yaml"))
+
+
+# Multi-веер кладёт явный ``plan``; одиночный маршрут планировщика — только
+# ``current_intent``. Восстанавливаем секцию из интента, чтобы judge видел
+# реальный выбор, а не пустой список (pattern/idle → не секция).
+_INTENT_TO_SECTION: dict[str, str] = {
+    "query": "spending",
+    "budgets": "budgets",
+    "subscriptions": "subscriptions",
+    "advice": "advice",
+}
+
+
+def _extract_plan(update: dict[str, Any]) -> list[str]:
+    """The section set the supervisor chose: explicit веер plan or a single route."""
+    plan = update.get("plan")
+    if plan:
+        return list(plan)
+    section = _INTENT_TO_SECTION.get(str(update.get("current_intent")))
+    return [section] if section else []
+
+
+async def _skip_if_postgres_unavailable() -> None:
+    try:
+        conn = await asyncpg.connect(dsn=get_settings().database_url.get_secret_value())
+    except (OSError, asyncpg.PostgresError) as exc:
+        pytest.skip(f"Postgres is unavailable: {exc}")
+    else:
+        await conn.close()
 
 
 # ── Categorization evals (LLM) ────────────────────────────────────────────────
@@ -105,9 +168,10 @@ async def test_categorization(case_path: Path) -> None:
     # per-test event loop lifecycle (OTLP exporter cleanup races the loop closure).
     # When running evals against a live LangFuse instance, use `just eval` from a
     # long-lived process (e.g. the bot) where the loop outlives the HTTP cleanup.
+    system_prompt = build_system_prompt(await PostgresCategoryCatalog().render_taxonomy())
     prediction: CategoryPrediction = await model.ainvoke(  # type: ignore[assignment]
         [
-            SystemMessage(content=CATEGORIZER_SYSTEM),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=f"Продавец: {tx.merchant_raw}\nСумма: {tx.amount} ₽"),
         ],
     )
@@ -127,6 +191,41 @@ async def test_categorization(case_path: Path) -> None:
             failures.append(
                 f"scorer={scorer_cfg['type']} field={scorer_cfg.get('field')} "
                 f"got={result} expected={case['expected']}"
+            )
+
+    assert not failures, f"{case['id']}: {'; '.join(failures)}"
+
+
+# ── Cascade evals (deterministic, live DB — no LLM) ──────────────────────────
+
+
+@pytest.mark.eval
+@pytest.mark.parametrize(
+    "case_path",
+    _load_cases("cascade"),
+    ids=lambda p: p.stem,
+)
+async def test_cascade(case_path: Path) -> None:
+    """Run a merchant through the rule cascade against the live DB — no LLM.
+
+    Covers the «узнать продавца без LLM» path and the learning loop (ответ
+    юзера → правило семьи). Skips when Postgres is unavailable.
+    """
+    await _skip_if_postgres_unavailable()
+
+    text = await asyncio.to_thread(case_path.read_text)
+    case: dict[str, Any] = yaml.safe_load(text)
+
+    result = await run_cascade(case["input"])
+
+    failures: list[str] = []
+    for scorer_cfg in case["scorers"]:
+        score = apply_scorer(scorer_cfg, result, case["expected"])
+        if score < 1.0:
+            field = scorer_cfg["field"]
+            failures.append(
+                f"scorer={scorer_cfg['type']} field={field} "
+                f"got={result.get(field)} expected={case['expected'].get(field)}"
             )
 
     assert not failures, f"{case['id']}: {'; '.join(failures)}"
@@ -236,6 +335,46 @@ async def test_tool_routing(case_path: Path) -> None:
             failures.append(
                 f"scorer={scorer_cfg['type']} field={field} "
                 f"got={result.get(field)} expected={case['expected'].get(field)}"
+            )
+
+    assert not failures, f"{case['id']}: {'; '.join(failures)}"
+
+
+# ── Multi-intent planner evals (orchestrator веер, ADR 0008) ─────────────────
+
+
+@pytest.mark.eval
+@pytest.mark.parametrize(
+    "case_path",
+    _load_cases("multi_intent"),
+    ids=lambda p: p.stem,
+)
+async def test_multi_intent(case_path: Path) -> None:
+    """Planner correctness: supervisor must fan out to the expected section set.
+
+    Keyword-based cases resolve the plan deterministically (no LLM); keyword-less
+    cases escalate to the LLM-планировщик and are scored by an LLM-judge on
+    whether the chosen section set reasonably covers the query (ADR 0008). We
+    assert only the PLAN (which workers fire), not the synthesized answer — the
+    eval harness has no live MCP/Postgres seed data.
+    """
+    text = await asyncio.to_thread(case_path.read_text)
+    case: dict[str, Any] = yaml.safe_load(text)
+
+    state: dict[str, Any] = {"messages": [HumanMessage(content=case["input"]["text"])]}
+    update = await supervisor_node(state)
+    result: dict[str, Any] = {"plan": _extract_plan(update)}
+
+    failures: list[str] = []
+    for scorer_cfg in case["scorers"]:
+        if scorer_cfg["type"] == "llm_judge":
+            score = await _llm_judge_plan(case["input"]["text"], result["plan"])
+        else:
+            score = apply_scorer(scorer_cfg, result, case["expected"])
+        if score < 1.0:
+            failures.append(
+                f"scorer={scorer_cfg['type']} field={scorer_cfg.get('field')} "
+                f"got={result} expected={case['expected']}"
             )
 
     assert not failures, f"{case['id']}: {'; '.join(failures)}"

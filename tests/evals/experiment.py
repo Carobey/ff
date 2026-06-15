@@ -28,13 +28,15 @@ from uuid import UUID
 import yaml
 from langfuse import Evaluation
 
-from family_finance.agents.categorizer import CATEGORIZER_SYSTEM, CategoryPrediction
+from family_finance.agents.categorizer import CategoryPrediction, build_system_prompt
 from family_finance.agents.supervisor import route_after_supervisor, supervisor_node
 from family_finance.domain import Category, Direction, Transaction, TransactionSource
 from family_finance.infrastructure.llm import get_chat_model
 from family_finance.infrastructure.observability.langfuse_setup import flush, get_langfuse
 from family_finance.infrastructure.parsers import TinkoffCsvParser
+from family_finance.infrastructure.persistence import PostgresCategoryCatalog
 from family_finance.infrastructure.security import check_injection
+from tests.evals.cascade_task import run_cascade
 from tests.evals.scorers import apply_scorer
 
 EVAL_FAMILY_ID = UUID("00000000-0000-0000-0000-000000000001")
@@ -61,9 +63,10 @@ async def _run_categorization(inp: dict[str, Any]) -> dict[str, Any]:
         import_hash=f"exp-{inp['merchant_raw']}",
     )
     model = get_chat_model(tier="worker").with_structured_output(CategoryPrediction)
+    system_prompt = build_system_prompt(await PostgresCategoryCatalog().render_taxonomy())
     prediction: CategoryPrediction = await model.ainvoke(
         [
-            SystemMessage(content=CATEGORIZER_SYSTEM),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=f"Продавец: {tx.merchant_raw}\nСумма: {tx.amount} ₽"),
         ],
     )
@@ -98,10 +101,17 @@ async def _run_routing(inp: dict[str, Any]) -> dict[str, Any]:
 
 _TASKS: dict[str, TaskFn] = {
     "categorization": _run_categorization,
+    "cascade": run_cascade,
     "csv_parsing": _run_csv,
     "security": _run_security,
     "tool_routing": _run_routing,
 }
+
+# Cascade-задачи делят одну asyncpg-коннекцию (общие репозитории) — конкурентные
+# операции по ней запрещены («another operation is in progress»). Гоняем cascade
+# последовательно; остальные агенты независимы и параллелятся свободно.
+_MAX_CONCURRENCY: dict[str, int] = {"cascade": 1}
+_DEFAULT_CONCURRENCY = 4
 
 
 def _load_cases(agent: str) -> list[dict[str, Any]]:
@@ -167,7 +177,7 @@ async def _run_agent(agent: str) -> None:
         name=f"{agent} eval",
         task=_task,
         evaluators=[_make_evaluator()],
-        max_concurrency=4,
+        max_concurrency=_MAX_CONCURRENCY.get(agent, _DEFAULT_CONCURRENCY),
     )
     print(result.format())
     print(f"→ {result.dataset_run_url}\n")

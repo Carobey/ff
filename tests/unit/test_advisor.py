@@ -9,9 +9,12 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from family_finance.agents.advisor import (
     SpendingHealth,
+    _money_figures,
+    advisor_node,
     analyze_spending,
     bucket_of,
     build_advice_block,
@@ -182,3 +185,138 @@ async def test_build_advice_block_flags_low_savings() -> None:
     # savings = 80000 - 70000 = 10000 → 12% < 20% norm; biggest want = delivery
     assert "Наставник" in block
     assert "food.delivery" in block
+
+
+# ── advisor_node (ReAct) ──────────────────────────────────────────────────────
+
+
+def _advisor_state(text: str) -> dict[str, object]:
+    return {"messages": [HumanMessage(content=text)], "family_id": str(uuid.uuid4())}
+
+
+@pytest.mark.unit
+async def test_advisor_node_gate_no_data_is_deterministic() -> None:
+    """No income, no expenses, no goal → honest message, никакого ReAct-цикла."""
+    with (
+        patch("family_finance.agents.advisor.MCPLedgerReader") as mock_cls,
+        patch("family_finance.agents.advisor.create_react_agent") as mock_agent,
+    ):
+        inst = mock_cls.return_value
+        inst.category_breakdown = AsyncMock(return_value=[])
+        inst.aggregate = AsyncMock(return_value=LedgerSummary(total=Decimal("0"), count=0))
+        inst.get_savings_goal = AsyncMock(return_value=None)
+        result = await advisor_node(_advisor_state("дай совет"))
+
+    mock_agent.assert_not_called()  # гейт сработал — LLM не трогаем
+    assert "выписку" in str(result["messages"][0].content).lower()
+    assert result["current_intent"] == "idle"
+
+
+@pytest.mark.unit
+async def test_advisor_node_react_happy_path() -> None:
+    """Есть данные → ReAct-агент формулирует ответ, он и уходит пользователю.
+
+    Сумма «12 300 ₽» пришла из инструмента (ToolMessage) → заземлена, проходит
+    само-критику ``_assert_grounded``.
+    """
+
+    class _FakeAgent:
+        async def ainvoke(self, _inp: object, config: object | None = None) -> dict[str, object]:
+            return {
+                "messages": [
+                    ToolMessage(content="Накопления: 12 300 ₽ в месяц.", tool_call_id="t1"),
+                    AIMessage(content="Сократи доставку, откладывай 12 300 ₽."),
+                ]
+            }
+
+    with (
+        patch("family_finance.agents.advisor.MCPLedgerReader") as mock_cls,
+        patch("family_finance.agents.advisor.get_chat_model", return_value=object()),
+        patch("family_finance.agents.advisor.create_react_agent", return_value=_FakeAgent()),
+    ):
+        inst = mock_cls.return_value
+        inst.category_breakdown = AsyncMock(
+            return_value=[
+                (Category.FOOD_DELIVERY, Decimal("30000"), 8),
+                (Category.FOOD_GROCERIES, Decimal("40000"), 10),
+            ]
+        )
+        inst.aggregate = AsyncMock(return_value=LedgerSummary(total=Decimal("120000"), count=2))
+        inst.get_savings_goal = AsyncMock(return_value=None)
+        result = await advisor_node(_advisor_state("на чём сэкономить?"))
+
+    assert "Сократи доставку" in str(result["messages"][0].content)
+    assert result["current_intent"] == "idle"
+
+
+@pytest.mark.unit
+async def test_advisor_node_falls_back_on_agent_error() -> None:
+    """ReAct падает → детерминированный fallback на посчитанных числах, не пусто."""
+
+    class _BoomAgent:
+        async def ainvoke(self, _inp: object, config: object | None = None) -> dict[str, object]:
+            raise RuntimeError("model down")
+
+    with (
+        patch("family_finance.agents.advisor.MCPLedgerReader") as mock_cls,
+        patch("family_finance.agents.advisor.get_chat_model", return_value=object()),
+        patch("family_finance.agents.advisor.create_react_agent", return_value=_BoomAgent()),
+    ):
+        inst = mock_cls.return_value
+        inst.category_breakdown = AsyncMock(
+            return_value=[
+                (Category.FOOD_DELIVERY, Decimal("30000"), 8),
+                (Category.FOOD_GROCERIES, Decimal("40000"), 10),
+            ]
+        )
+        inst.aggregate = AsyncMock(return_value=LedgerSummary(total=Decimal("120000"), count=2))
+        inst.get_savings_goal = AsyncMock(return_value=None)
+        result = await advisor_node(_advisor_state("как копить?"))
+
+    content = str(result["messages"][0].content)
+    # savings = 120000 - 70000 = 50000 → 42% ≥ 20% норма; fallback упоминает процент.
+    assert "%" in content
+    assert result["current_intent"] == "idle"
+
+
+@pytest.mark.unit
+async def test_advisor_node_falls_back_on_ungrounded_figure() -> None:
+    """ReAct выдал сумму, которой нет в выводе инструментов → fallback, не галлюцинация."""
+
+    class _HallucinatingAgent:
+        async def ainvoke(self, _inp: object, config: object | None = None) -> dict[str, object]:
+            # 999 999 ₽ не приходило ни из одного инструмента (ToolMessage отсутствует).
+            return {"messages": [AIMessage(content="Откладывай 999 999 ₽ в месяц.")]}
+
+    with (
+        patch("family_finance.agents.advisor.MCPLedgerReader") as mock_cls,
+        patch("family_finance.agents.advisor.get_chat_model", return_value=object()),
+        patch(
+            "family_finance.agents.advisor.create_react_agent",
+            return_value=_HallucinatingAgent(),
+        ),
+    ):
+        inst = mock_cls.return_value
+        inst.category_breakdown = AsyncMock(
+            return_value=[
+                (Category.FOOD_DELIVERY, Decimal("30000"), 8),
+                (Category.FOOD_GROCERIES, Decimal("40000"), 10),
+            ]
+        )
+        inst.aggregate = AsyncMock(return_value=LedgerSummary(total=Decimal("120000"), count=2))
+        inst.get_savings_goal = AsyncMock(return_value=None)
+        result = await advisor_node(_advisor_state("сколько откладывать?"))
+
+    content = str(result["messages"][0].content)
+    assert "999 999" not in content  # выдуманная сумма не ушла пользователю
+    assert "%" in content  # детерминированный fallback на посчитанных числах
+    assert result["current_intent"] == "idle"
+
+
+# ── _money_figures (заземление само-критики) ──────────────────────────────────
+
+
+@pytest.mark.unit
+def test_money_figures_extracts_and_normalizes() -> None:
+    assert _money_figures("Накопления 12 300 ₽, желания 5 000 ₽.") == {"12300", "5000"}
+    assert _money_figures("без сумм, только 42%") == set()

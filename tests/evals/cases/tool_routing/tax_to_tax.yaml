@@ -1,0 +1,11 @@
+id: route_004
+agent: supervisor
+description: "Запрос налогового вычета → нода tax (оценка возврата НДФЛ, ст. 219 НК)"
+tags: [tool-call, routing, tax, ru]
+input:
+  text: "какой налоговый вычет я могу получить"
+expected:
+  route: tax
+scorers:
+  - type: tool_call
+    field: route

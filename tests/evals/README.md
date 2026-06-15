@@ -1,6 +1,6 @@
 # Evals
 
-19 кейсов в YAML, разбитых по агентам. Два способа прогона — быстрый pytest-гейт
+29 кейсов в YAML, разбитых по агентам. Два способа прогона — быстрый pytest-гейт
 и полноценный эксперимент с заливкой в LangFuse для дашборда.
 
 ## Три типа проверок (требование диплома)
@@ -16,10 +16,18 @@
 ```
 tests/evals/cases/
 ├── categorization/   # 11 — categorizer (LLM), exact_match + порог confidence + llm_judge
+├── cascade/          #  3 — rule→LLM каскад + learning loop (детерминированно)
 ├── csv_parsing/      #  2 — TinkoffCsvParser (детерминированно)
 ├── security/         #  3 — injection guard (2 детерм. паттерна + 1 семантический)
-└── tool_routing/     #  3 — supervisor routing, tool_call по выбранной ноде
+├── tool_routing/     #  4 — supervisor routing, tool_call по выбранной ноде
+└── multi_intent/     #  6 — Send-веер план (4 exact_match + 2 llm_judge)
 ```
+
+> `just eval` (pytest-гейт) гоняет все 29 кейсов и даёт полный success rate.
+> `just eval-report` (LangFuse) скорит детерминированный субсет 23 кейса
+> (categorization 11, cascade*, csv 2, security 3, tool_routing 4); multi_intent
+> и async-llm_judge — только в pytest-гейте. *cascade в LangFuse-раннере пока
+> падает на конкуренции asyncpg (см. BACKLOG), в pytest-гейте проходит.
 
 Формат кейса — см. `.claude/skills/eval-writer/SKILL.md` и любой `*.yaml`.
 

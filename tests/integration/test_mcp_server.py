@@ -31,7 +31,8 @@ async def _skip_if_postgres_unavailable() -> None:
 
 
 @pytest.mark.integration
-async def test_aggregate_spending_tool_round_trip() -> None:
+async def test_query_aggregates_tool_round_trip() -> None:
+    """query_aggregates: grand total (group_by=total) + per-day breakdown."""
     await _skip_if_postgres_unavailable()
 
     repo = PostgresTransactionRepository()
@@ -45,8 +46,21 @@ async def test_aggregate_spending_tool_round_trip() -> None:
             Transaction(
                 family_id=family_id,
                 member_id=member_id,
-                occurred_at=datetime(2026, 4, 10, tzinfo=UTC),
+                occurred_at=datetime(2026, 4, 10, 9, tzinfo=UTC),
                 amount=Decimal("100.00"),
+                currency=Currency.RUB,
+                direction=Direction.EXPENSE,
+                merchant_raw="MCP pharmacy",
+                category=Category.HEALTH_PHARMACY,
+                confidence=1.0,
+                source=TransactionSource.BANK_CSV,
+                import_hash=f"mcp:{uuid.uuid4()}",
+            ),
+            Transaction(
+                family_id=family_id,
+                member_id=member_id,
+                occurred_at=datetime(2026, 4, 12, 9, tzinfo=UTC),
+                amount=Decimal("250.00"),
                 currency=Currency.RUB,
                 direction=Direction.EXPENSE,
                 merchant_raw="MCP pharmacy",
@@ -57,20 +71,81 @@ async def test_aggregate_spending_tool_round_trip() -> None:
             ),
         ]
     )
+    window = {
+        "family_id": str(family_id),
+        "categories": [Category.HEALTH_PHARMACY.value],
+        "directions": [Direction.EXPENSE.value],
+        "start": "2026-04-01T00:00:00+00:00",
+        "end": "2026-05-01T00:00:00+00:00",
+    }
 
-    result = await call_finance_tool(
-        "aggregate_spending",
+    total = await call_finance_tool("query_aggregates", {**window, "group_by": "total"})
+    assert len(total) == 1
+    assert Decimal(str(total[0]["total"])) == Decimal("350.00")
+    assert total[0]["count"] == 2
+
+    by_day = await call_finance_tool("query_aggregates", {**window, "group_by": "day"})
+    # Two distinct days, chronological, each its own sum.
+    assert [r["bucket"] for r in by_day] == ["2026-04-10", "2026-04-12"]
+    assert [Decimal(str(r["total"])) for r in by_day] == [Decimal("100.00"), Decimal("250.00")]
+
+
+@pytest.mark.integration
+async def test_list_transactions_tool_round_trip() -> None:
+    """list_transactions returns individual rows, biggest first when asked."""
+    await _skip_if_postgres_unavailable()
+
+    repo = PostgresTransactionRepository()
+    telegram_user_id = uuid.uuid4().int % 2_000_000_000
+    family_id, member_id = await repo.ensure_member_for_telegram(
+        telegram_user_id=telegram_user_id,
+        name=f"MCP {telegram_user_id}",
+    )
+    await repo.add_many(
+        [
+            Transaction(
+                family_id=family_id,
+                member_id=member_id,
+                occurred_at=datetime(2026, 4, 10, 9, tzinfo=UTC),
+                amount=Decimal("100.00"),
+                currency=Currency.RUB,
+                direction=Direction.EXPENSE,
+                merchant_raw="Small shop",
+                category=Category.SHOPPING_GENERIC,
+                confidence=1.0,
+                source=TransactionSource.BANK_CSV,
+                import_hash=f"mcp-list:{uuid.uuid4()}",
+            ),
+            Transaction(
+                family_id=family_id,
+                member_id=member_id,
+                occurred_at=datetime(2026, 4, 11, 9, tzinfo=UTC),
+                amount=Decimal("900.00"),
+                currency=Currency.RUB,
+                direction=Direction.EXPENSE,
+                merchant_raw="Big shop",
+                category=Category.SHOPPING_GENERIC,
+                confidence=1.0,
+                source=TransactionSource.BANK_CSV,
+                import_hash=f"mcp-list:{uuid.uuid4()}",
+            ),
+        ]
+    )
+
+    rows = await call_finance_tool(
+        "list_transactions",
         {
             "family_id": str(family_id),
-            "categories": [Category.HEALTH_PHARMACY.value],
-            "directions": [Direction.EXPENSE.value],
+            "categories": [Category.SHOPPING_GENERIC.value],
             "start": "2026-04-01T00:00:00+00:00",
             "end": "2026-05-01T00:00:00+00:00",
+            "order_by": "amount_desc",
+            "limit": 5,
         },
     )
 
-    assert Decimal(str(result["total"])) == Decimal("100.00")
-    assert result["count"] == 1
+    assert [r["merchant"] for r in rows] == ["Big shop", "Small shop"]
+    assert Decimal(str(rows[0]["amount"])) == Decimal("900.00")
 
 
 @pytest.mark.integration

@@ -1,0 +1,11 @@
+id: multi_001
+agent: supervisor
+description: "Три интента через запятые → веер spending+budgets+advice (без LLM)"
+tags: [multi-intent, routing, orchestrator, ru]
+input:
+  text: "проанализируй расходы за апрель, проверь бюджеты и дай рекомендации"
+expected:
+  plan: [spending, budgets, advice]
+scorers:
+  - type: exact_match
+    field: plan

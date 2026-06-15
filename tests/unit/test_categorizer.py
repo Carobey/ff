@@ -12,9 +12,11 @@ import pytest
 from family_finance.agents.categorizer import (
     CategoryPrediction,
     _merge_enriched,
+    _resolve_by_rules,
     _select_for_llm,
     categorizer_node,
 )
+from family_finance.application.ports import MerchantRuleHit
 from family_finance.domain import Category, Direction, Transaction, TransactionSource
 
 
@@ -112,6 +114,79 @@ def test_merge_enriched_keeps_unmatched() -> None:
     assert len(merged) == 2
     keep_result = next(t for t in merged if t.import_hash == "keep_hash")
     assert keep_result.category == Category.FOOD_RESTAURANT  # unchanged
+
+
+# ── _resolve_by_rules (cascade step 1) ────────────────────────────────────────
+
+
+class _FakeRuleRepo:
+    """Rule repo stub: returns a hit only for merchants in ``hits``."""
+
+    def __init__(self, hits: dict[str, MerchantRuleHit]) -> None:
+        self._hits = hits
+
+    async def lookup_many(
+        self, *, family_id: uuid.UUID, merchants: list[str], threshold: float
+    ) -> dict[str, MerchantRuleHit]:
+        return {m: self._hits[m] for m in merchants if m in self._hits}
+
+    async def upsert(self, **kwargs: object) -> None:  # pragma: no cover - unused here
+        return None
+
+
+@pytest.mark.unit
+async def test_resolve_by_rules_splits_hits_and_misses() -> None:
+    hit_tx = _make_tx(merchant="ПЯТЕРОЧКА 12", category=Category.UNCLASSIFIED)
+    miss_tx = _make_tx(merchant="ЗАГАДОЧНЫЙ ПРОДАВЕЦ", category=Category.UNCLASSIFIED)
+    # distinct import_hash so the enriched map keys don't collide
+    miss_tx = miss_tx.model_copy(update={"import_hash": "miss-hash"})
+
+    rule_repo = _FakeRuleRepo(
+        {
+            "ПЯТЕРОЧКА 12": MerchantRuleHit(
+                category=Category.FOOD_GROCERIES, score=0.9, source="seed"
+            )
+        }
+    )
+
+    with patch("family_finance.agents.categorizer.PostgresTransactionRepository") as mock_repo_cls:
+        repo_instance = MagicMock()
+        repo_instance.classify_by_import_hashes = AsyncMock(return_value=1)
+        mock_repo_cls.return_value = repo_instance
+
+        enriched, remaining = await _resolve_by_rules(
+            [hit_tx, miss_tx],
+            family_id=uuid.uuid4(),
+            rule_repo=rule_repo,  # type: ignore[arg-type]
+            threshold=0.6,
+        )
+
+    # hit → enriched without LLM, persisted; miss → returned for LLM
+    assert [tx.merchant_raw for tx in remaining] == ["ЗАГАДОЧНЫЙ ПРОДАВЕЦ"]
+    assert hit_tx.import_hash is not None
+    resolved = enriched[hit_tx.import_hash]
+    assert resolved.category == Category.FOOD_GROCERIES
+    assert resolved.direction == Direction.EXPENSE
+    assert resolved.needs_review is False
+    repo_instance.classify_by_import_hashes.assert_awaited_once()
+
+
+@pytest.mark.unit
+async def test_resolve_by_rules_degrades_on_lookup_error() -> None:
+    class _BoomRepo:
+        async def lookup_many(self, **kwargs: object) -> dict[str, MerchantRuleHit]:
+            raise RuntimeError("db down")
+
+    txs = [_make_tx(category=Category.UNCLASSIFIED)]
+    enriched, remaining = await _resolve_by_rules(
+        txs,
+        family_id=uuid.uuid4(),
+        rule_repo=_BoomRepo(),  # type: ignore[arg-type]
+        threshold=0.6,
+    )
+    # Soft degradation: nothing resolved, everything flows to LLM.
+    assert enriched == {}
+    assert remaining == txs
 
 
 # ── categorizer_node ──────────────────────────────────────────────────────────

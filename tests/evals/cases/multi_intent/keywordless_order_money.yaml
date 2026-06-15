@@ -1,0 +1,11 @@
+id: multi_005
+agent: supervisor
+description: "Бес-ключевая формулировка про порядок в деньгах → LLM-планировщик"
+tags: [multi-intent, routing, planner, llm-judge, ru]
+input:
+  text: "хочу навести порядок в деньгах и понять куда они утекают"
+expected:
+  plan: [spending, advice]
+scorers:
+  - type: llm_judge
+    field: plan

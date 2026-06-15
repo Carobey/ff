@@ -1,0 +1,11 @@
+id: multi_006
+agent: supervisor
+description: "Траты + налоговый вычет через запятую → веер spending+tax (без LLM)"
+tags: [multi-intent, routing, orchestrator, tax, ru]
+input:
+  text: "посчитай налоговый вычет, и сколько потратил за апрель"
+expected:
+  plan: [spending, tax]
+scorers:
+  - type: exact_match
+    field: plan

@@ -41,8 +41,8 @@ def test_categorise_item_notebook() -> None:
 
 
 @pytest.mark.unit
-def test_categorise_item_unknown_defaults_to_groceries() -> None:
-    assert _categorise_item("Неизвестный товар XYZ") == Category.FOOD_GROCERIES
+def test_categorise_item_unknown_defaults_to_unclassified() -> None:
+    assert _categorise_item("Неизвестный товар XYZ") == Category.UNCLASSIFIED
 
 
 # ── _items_word ───────────────────────────────────────────────────────────────

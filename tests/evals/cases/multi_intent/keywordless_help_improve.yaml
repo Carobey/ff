@@ -1,0 +1,15 @@
+id: multi_004
+agent: supervisor
+description: >
+  Бес-ключевая формулировка → LLM-планировщик выбирает набор разделов.
+  Двойной интент явный (анализ трат + совет), но без keyword-токенов
+  ("на что уходят деньги" ≠ трат/расход; "что улучшить" ≠ совет/рекоменд),
+  поэтому путь идёт через LLM-планировщик, а не keyword-веер.
+tags: [multi-intent, routing, planner, llm-judge, ru]
+input:
+  text: "посмотри, на что уходят деньги в нашей семье, и предложи, что можно улучшить"
+expected:
+  plan: [spending, advice]
+scorers:
+  - type: llm_judge
+    field: plan

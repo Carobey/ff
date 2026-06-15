@@ -1,0 +1,17 @@
+id: casc_001
+agent: cascade
+description: "Известный продавец из справочника → правило (без LLM)"
+tags: [cascade, rule, no-llm, prompt-v1]
+input:
+  merchant_raw: "ПЯТЕРОЧКА 4587 МСК"
+expected:
+  rule_hit: true
+  category: food.groceries
+  source: seed
+scorers:
+  - type: exact_match
+    field: rule_hit
+  - type: exact_match
+    field: category
+  - type: exact_match
+    field: source

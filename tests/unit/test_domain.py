@@ -18,6 +18,8 @@ from family_finance.domain import (
     Direction,
     Transaction,
     TransactionSource,
+    direction_for_category,
+    normalize_merchant,
 )
 
 
@@ -90,3 +92,35 @@ class TestTransaction:
             confidence=0.9,
         )
         assert tx.needs_review is False
+
+
+@pytest.mark.unit
+class TestNormalizeMerchant:
+    def test_lowercases_and_unifies_yo(self) -> None:
+        assert normalize_merchant("ПЯТЁРОЧКА") == "пятерочка"
+
+    def test_strips_punctuation_and_noise(self) -> None:
+        # пунктуация → пробел, номер терминала остаётся как токен
+        assert normalize_merchant("Яндекс.Еда") == "яндекс еда"
+        assert normalize_merchant("ПЯТЕРОЧКА 1234  MOSCOW RUS") == "пятерочка 1234 moscow rus"
+
+    def test_empty_on_pure_noise(self) -> None:
+        assert normalize_merchant("*** --- ***") == ""
+
+    def test_idempotent(self) -> None:
+        once = normalize_merchant("ВкусВилл №7")
+        assert normalize_merchant(once) == once
+
+
+@pytest.mark.unit
+class TestDirectionForCategory:
+    def test_income_categories(self) -> None:
+        assert direction_for_category(Category.INCOME_SALARY) == Direction.INCOME
+        assert direction_for_category(Category.INCOME_OTHER) == Direction.INCOME
+
+    def test_internal_transfer(self) -> None:
+        assert direction_for_category(Category.TRANSFER_INTERNAL) == Direction.TRANSFER
+
+    def test_default_is_expense(self) -> None:
+        assert direction_for_category(Category.FOOD_GROCERIES) == Direction.EXPENSE
+        assert direction_for_category(Category.HEALTH_PHARMACY) == Direction.EXPENSE

@@ -1,6 +1,6 @@
 id: route_001
 agent: supervisor
-description: "Вопрос о тратах → tool/нода ledger (aggregate_spending через MCP)"
+description: "Вопрос о тратах → tool/нода ledger (query_aggregates через MCP)"
 tags: [tool-call, routing, ledger, ru]
 input:
   text: "сколько на еду в мае?"
