@@ -36,6 +36,16 @@ ps:
 nuke:
     docker compose --profile phase2 down -v
 
+# Обнулить ПОЛЬЗОВАТЕЛЬСКИЕ данные (семьи → каскадом транзакции/чеки/бюджеты/цели/выученные
+# правила, диалоги LangGraph, episodic-память Graphiti). Схема и справочники (category +
+# merchant-сиды) сохраняются. Контейнеры должны быть подняты (just up).
+reset-data:
+    @echo "⚠️  Удаляю ВСЕ пользовательские данные (Postgres + Graphiti). Справочники сохраняются."
+    docker compose exec -T postgres psql -U postgres -d family_finance -v ON_ERROR_STOP=1 \
+        -c "BEGIN; DELETE FROM family; TRUNCATE checkpoints, checkpoint_blobs, checkpoint_writes; COMMIT;"
+    docker compose exec -T falkordb redis-cli FLUSHALL
+    @echo "✅ База обнулена: пользовательские данные удалены, сиды на месте."
+
 # === Dev ===
 
 run:

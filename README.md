@@ -1,46 +1,54 @@
 # Family Finance Assistant
 
-> Telegram-бот, который превращает банковские выписки и фото чеков в понятную картину семейных финансов.
-
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.2.x-orange)
 ![type-checked](https://img.shields.io/badge/mypy-strict-blue)
 ![lint](https://img.shields.io/badge/lint-ruff-purple)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Дипломный проект курса AI-агентов: multi-agent система на LangGraph (supervisor + 9
-специалистов), persistent-память, observability в LangFuse и собственный MCP-сервер.
+Telegram-бот для семейных финансов: импортирует выписки и чеки, отвечает по истории
+операций, выявляет поведенческие паттерны и оценивает налоговые вычеты.
+
+Дипломный проект курса AI-агентов: supervisor-граф на LangGraph с 10 specialist-нодами,
+human-in-the-loop, persistent state, self-hosted LangFuse и собственным MCP-сервером.
 
 ## Возможности
 
-- **Импорт выписок** — CSV Тинькофф / PDF Сбербанк, дедупликация по import-hash.
-- **Чеки** — распознавание по QR (ФНС API `proverkacheka`) или по фото (vision-LLM).
-- **Категоризация** — LLM со structured output; низкая уверенность → уточняющие вопросы.
-- **Вопросы о тратах** — «сколько на еду в мае?», «все расходы за апрель» (SQL-агрегация через MCP).
-- **Подписки** — детект повторяющихся списаний и забытых «зомби-подписок».
-- **Бюджеты и цели** — алерты при превышении лимита, прогресс по накоплениям.
-- **Поведенческие инсайты** — «когда я в последний раз так тратил?» через episodic-память (Graphiti).
-- **Приватность** — маскирование PII (Presidio) перед облачным LLM + injection-guard.
+- **Импорт выписок** - CSV Тинькофф / PDF Сбербанк, preview и HITL-подтверждение
+  перед записью, дедупликация по `import_hash`.
+- **Чеки** - распознавание по QR (ФНС API `proverkacheka`) или по фото (vision-LLM).
+- **Категоризация** - merchant rules → structured-output LLM → HITL-уточнение;
+  ответы семьи сохраняются как правила для следующих импортов.
+- **Вопросы о тратах** - «сколько на еду в мае?», «все расходы за апрель»
+  (детерминированная SQL-агрегация через MCP).
+- **Составные запросы** - параллельный `Send`-веер для трат, бюджетов, подписок,
+  рекомендаций и налогов с детерминированным fan-in.
+- **Подписки** - детект повторяющихся списаний и забытых «зомби-подписок».
+- **Бюджеты и цели** - алерты при превышении лимита, прогресс по накоплениям.
+- **Поведенческие инсайты** - «когда я в последний раз так тратил?» через episodic-память (Graphiti).
+- **Расчёт налоговых вычетов** - pure-domain расчет на `Decimal`; недостающие данные
+  запрашиваются через HITL `interrupt/resume`.
+- **Приватность** - маскирование PII (Presidio) перед облачным LLM + injection-guard.
 
 ## Стек
 
 - **LangGraph 1.2.x** — supervisor pattern
 - **Telegram** — aiogram 3.x (главный интерфейс)
 - **OpenRouter** — multi-provider LLM gateway через `langchain-openrouter`
-- **PostgreSQL 17** — persistence + LangGraph checkpointer (`PostgresSaver`); pgvector — план Phase 2 (см. RAG ниже)
+- **PostgreSQL 17** — persistence + LangGraph checkpointer (`PostgresSaver`)
 - **LangFuse self-host** — observability, evals, prompt management
 - **FalkorDB + Graphiti** — episodic memory (поведенческие паттерны)
 - **MCP** — свой FastMCP read-only сервер (`fastmcp`) + LangGraph-потребитель (`langchain-mcp-adapters`)
-- **Presidio** — маскирование PII перед отправкой в cloud-LLM (+ свой injection guard)
+- **Presidio** — маскирование PII перед отправкой в cloud-LLM (+ injection guard)
 
 ## Архитектура
 
 ```
-ff/
-├── domain/            # Pure Pydantic — Transaction, Receipt, Family, Budget, SavingsGoal, Subscription, DigestSchedule
+src/family_finance/
+├── domain/            # Pure Pydantic — транзакции, чеки, бюджеты, цели, налоговый расчёт
 ├── application/       # Protocol-ports (сценарии — ноды LangGraph в agents/)
-├── infrastructure/    # Adapters: LLM, memory, observability, MCP-client, settings
-├── agents/            # LangGraph: state, supervisor, 9 specialist-нод
+├── infrastructure/    # Postgres, parsers, LLM, memory, observability, MCP, security
+├── agents/            # LangGraph: state, supervisor, compaction, specialists, workers
 ├── mcp_server/        # FastMCP read-only сервер (interface-слой, как bot/)
 └── bot/               # Telegram (aiogram)
 ```
@@ -49,17 +57,30 @@ ff/
 
 ## Схема графа
 
-LangGraph-граф нелинейный, с **двумя точками ветвления** (роутинг в Python, не в
-промпте — см. [supervisor.py](src/ff/agents/supervisor.py)):
+Граф сочетает условный routing, параллельный `Send`-веер, три HITL-взаимодействия
+и learning loop категоризации:
 
-1. **`supervisor`** — после injection-guard классифицирует интент и направляет в
-   одного из специалистов (или `END` для small-talk / заблокированной инъекции).
-2. **`ingest`** — после парсинга выписки направляет в `categorizer`, только если
-   появились новые транзакции; пустой импорт / ошибка парсинга идут в `END`.
+- На входе — нода **`compact`**: сворачивает длинный тред в краткую сводку, как
+  только накапливается >20 сообщений (rolling summary через `RemoveMessage`); ниже
+  порога — no-op без LLM. Это предобработка, не маршрутизация (всегда → `supervisor`).
+- **`supervisor`** после injection-guard выбирает intent: один
+  интент → одна specialist-нода; мульти-интент («траты + подписки + совет») → веер
+  `Send` на `section_worker` (orchestrator-worker) с join в `synthesizer`;
+  small-talk / заблокированная инъекция → `END`.
+- **HITL import**: `ingest` после чистого парсинга вызывает `interrupt()`; кнопка
+  или текст возобновляет ту же ноду через `Command(resume=...)`. Запись начинается
+  только после подтверждения.
+- **HITL clarification**: `categorizer` сохраняет `open_questions`; ответ приходит
+  следующим Telegram-turn и маршрутизируется в `clarify`.
+- **HITL tax**: `tax` при нехватке данных вызывает `interrupt()` и продолжает расчет
+  после resume.
+- **Learning loop**: `clarify` сохраняет family-scoped merchant rule; следующий
+  импорт использует его до LLM и обычно больше не задает тот же вопрос.
 
 ```mermaid
 flowchart TD
-    IN([вход]) --> SUP{{"supervisor<br/>injection-guard + интент"}}
+    IN([вход]) --> CMP["compact<br/>свёртка длинного треда"]
+    CMP --> SUP{{"supervisor<br/>injection-guard + интент"}}
     SUP -->|фото чека| RC[receipt]
     SUP -->|CSV / PDF| ING{{ingest}}
     SUP -->|ответ на уточнение| CL[clarify]
@@ -68,59 +89,86 @@ flowchart TD
     SUP -->|подписки| SB[subscriptions]
     SUP -->|бюджеты| BD[budgets]
     SUP -->|совет| AD[advisor]
+    SUP -->|налоговый вычет| TX[tax]
+    SUP -.->|мульти-интент: Send-веер| SW[section_worker]
     SUP -->|small-talk / инъекция| E([END])
-    ING -->|есть новые транзакции| CAT[categorizer]
+
+    SW --> SY[synthesizer]
+    SY --> E
+
+    ING -->|после парсинга| HIMP{{"HITL #1<br/>подтвердить импорт"}}
+    HIMP -. "Command(resume=yes/no)" .-> ING
+    ING -->|подтверждено, есть новые строки| CAT[categorizer]
     ING -->|пусто / ошибка парсинга| E
-    CAT --> E
-    RC --> E
+
+    CAT -->|needs_review| HCL{{"HITL #2<br/>уточнить категорию"}}
+    HCL -. "ответ: новый Telegram-turn" .-> IN
+    CAT -->|нет вопросов| E
+    CL --> RULE[("merchant_category_rule<br/>family-scoped")]
+    RULE -. "learning loop: следующий импорт" .-> CAT
     CL --> E
+
+    TX -->|нужны доход / признаки вычета| HTAX{{"HITL #3<br/>уточнить данные"}}
+    HTAX -. "Command(resume=answers)" .-> TX
+    TX -->|расчёт готов| E
+
+    RC --> E
     LD --> E
     CO --> E
     SB --> E
     BD --> E
     AD --> E
+
+    classDef hitl fill:#fff3cd,stroke:#b58105,stroke-width:2px,color:#111;
+    class HIMP,HCL,HTAX hitl;
 ```
+
+Сплошные стрелки показывают переходы внутри run. Пунктиром отмечены resume/cross-turn
+переходы и learning loop, влияющий на будущие импорты.
 
 ## RAG / Retrieval
 
-Классический документный RAG (chunk → embed → retrieve → stuff в промпт) проекту
-**не нужен**: основные данные — структурированные транзакции в Postgres, и точные
-ответы даёт SQL-агрегация (через MCP-инструменты), а не приближённый векторный
-поиск. Семантический retrieval всё же присутствует там, где он уместен:
+Классический документный RAG проекту **не нужен**: основные данные — структурированные транзакции в Postgres, и точные ответы даёт SQL-агрегация (через MCP-инструменты), а не приближённый векторный поиск. Семантический retrieval всё же присутствует там, где он уместен:
 
-- **Episodic retrieval (Graphiti).** `coach`-нода отвечает на поведенческие вопросы
-  («когда я в последний раз так тратил?») через `search_episodes` —
-  семантический поиск по графу эпизодов в FalkorDB
-  ([coach.py](src/family_finance/agents/coach.py)).
+- **Episodic retrieval (Graphiti).** `coach`-нода (ReAct поверх MCP-инструментов)
+  на поведенческие вопросы («когда я в последний раз так тратил?») берёт
+  датированные факты из SQL-агрегатов, а качественный контекст — опциональным
+  инструментом `recall_episodes` → `search_episodes`: семантический поиск по графу
+  эпизодов в FalkorDB ([coach.py](src/family_finance/agents/coach.py)).
 
 ## MCP-слой
 
 Курс требует связку **MCP + LangGraph**. Проект демонстрирует **обе** стороны
 протокола: свой read-only **сервер** (producer) и LangGraph-узлы как **потребитель**
-(consumer).
+(consumer). 
 
 - **Producer** — `mcp_server/server.py` на `FastMCP` (транспорт stdio): 7 read-only
   инструментов поверх репозитория, без записи в БД. Деньги пересекают границу
   **строками** (репозиторий кастит `NUMERIC→TEXT`) — ни один `float` не уходит в протокол.
-- **Consumer** — read-узлы графа (`ledger`, `advisor`, `budgets`, `subscriptions`) читают
-  агрегаты **через MCP-инструменты**, а не напрямую из репозитория. Клиентская обвязка —
-  `infrastructure/mcp/`: `MultiServerMCPClient` (stdio) + `MCPLedgerReader` —
-  repo-образный фасад, который восстанавливает доменные объекты из JSON.
-- Тот же сервер переиспользуем внешними MCP-клиентами (Claude Desktop, будущий Family Hub).
+- **Consumer** — read-узлы графа (`ledger`, `coach`, `subscriptions`, `budgets`,
+  `advisor`, `tax`) читают агрегаты **через MCP-инструменты**, а не напрямую из
+  репозитория. Клиентская обвязка — `infrastructure/mcp/`: `MultiServerMCPClient`
+  (stdio) + `MCPLedgerReader` (repo-образный фасад, восстанавливает доменные объекты
+  из JSON) и `call_finance_tool` (прямой вызов для ReAct-нод `coach`/`ledger`).
+- Тот же сервер переиспользуем внешними MCP-клиентами.
 
 ```mermaid
 flowchart LR
     subgraph LG["LangGraph — consumer"]
         direction TB
         L[ledger]
-        A[advisor]
-        B[budgets]
+        C[coach]
         S[subscriptions]
-        R["MCPLedgerReader<br/>infrastructure/mcp"]
+        B[budgets]
+        A[advisor]
+        T[tax]
+        R["infrastructure/mcp<br/>MCPLedgerReader · call_finance_tool"]
         L --> R
-        A --> R
-        B --> R
+        C --> R
         S --> R
+        B --> R
+        A --> R
+        T --> R
     end
 
     EXT["Внешние MCP-клиенты<br/>Claude Desktop · Family Hub"]
@@ -129,12 +177,14 @@ flowchart LR
     EXT -->|stdio| SRV
 
     subgraph MCP["FastMCP server — producer · mcp_server/"]
-        SRV["7 read-only tools<br/>aggregate_spending · spending_by_category<br/>goal_status · savings_goal · net_cashflow<br/>budget_status · detect_recurring"]
+        SRV["7 read-only tools<br/>query_aggregates · list_transactions<br/>goal_status · savings_goal · net_cashflow<br/>budget_status · detect_recurring"]
     end
 
     SRV --> REPO["PostgresTransactionRepository<br/>деньги строками (NUMERIC→TEXT)"]
     REPO --> PG[("PostgreSQL")]
 ```
+
+`just run` запускает бот, который сам поднимает и прогревает MCP stdio subprocess.
 
 ```bash
 just mcp         # запустить MCP-сервер по stdio (для Claude Desktop / внешних агентов)
@@ -177,30 +227,30 @@ just run
 # Trace появится в LangFuse: http://localhost:3001/project/ff-project/traces
 ```
 
-## Команды для разработки
+## Команды разработчика
 
 ```bash
 just              # список команд
-just lint         # ruff + mypy --strict
+just lint         # ruff + mypy
 just fmt          # auto-format
 just test         # unit tests
 just test-all     # все тесты включая интеграционные
-just cov          # тесты + отчёт о покрытии
-just eval         # прогон eval-сюиты (LangFuse)
-just printgraph   # отрисовать граф LangGraph
+just eval         # eval-сюита, включая LLM-as-judge
+just eval-report  # загрузить datasets/experiment в LangFuse
+just printgraph   # сгенерировать docs/graph.mmd из текущего StateGraph
 just mcp          # запустить MCP-сервер (stdio)
 just check-mcp    # MCP-сервер стартует и отдаёт инструменты
 just smoke        # инфра + проверки + инструкция
+just logs <svc>   # логи сервиса
 just nuke         # ⚠ удаление volumes
 ```
 
-## Структура проекта
+## Структура проекта (полная)
 
 ```
-ff/
+family-finance/
 ├── docs/
 │   ├── ARCHITECTURE.md
-│   ├── ROADMAP.md            # фазы 0 → диплом → Family Hub
 │   ├── SECURITY.md           # PII-маскирование + injection guard, ФЗ-152
 │   └── adr/                  # Architecture Decision Records
 │
@@ -218,10 +268,13 @@ ff/
 └── tests/
     ├── unit/                 # Pure domain tests
     ├── integration/          # С docker-сервисами
-    └── evals/                # 19 кейсов + LangFuse datasets/experiments
+    └── evals/                # 29 кейсов + LangFuse datasets/experiments
 ```
 
 ## Security-чеклист
+
+Полное описание — [docs/SECURITY.md](docs/SECURITY.md). Статусы: ✅ реализовано ·
+🚫 неприменимо · ⏳ открыто.
 
 | Пункт | Статус | Как / почему |
 |---|---|---|
@@ -231,19 +284,22 @@ ff/
 | Авторизация доступа к боту | ✅ | allowlist `TELEGRAM_ALLOWED_USER_IDS`; пустой список закрывает доступ |
 | Read-only граница наружу (MCP) | ✅ | MCP-сервер не пишет в БД, деньги пересекают границу строками (`NUMERIC→TEXT`) |
 | Output-валидация структуры LLM | ✅ | `with_structured_output(Schema)` вместо парсинга строк регексом |
-| Allowlist доменов для внешних API | ✅ | внешних HTTP-вызовов два: OpenRouter и proverkacheka.com (ФНС), оба захардкожены |
-| Маскирование имён (PERSON-NER) | ⏳ открыто | требует тяжёлой `ru_core_news_md`; осознанно отложено (см. SECURITY.md) |
-| Трансграничная передача (ФЗ-152) | ⏳ открыто | OpenRouter — зарубежные провайдеры; для прод-ФЗ-152 нужен локальный инференс |
-| Rate-limiting / anti-DoS | ⏳ открыто | single-family дипломный бот за allowlist; не приоритет до публичного деплоя |
-| Output-guardrail на «галлюцинацию чисел» | 🚫 неприменимо | числа берутся из SQL-агрегатов, LLM лишь формулирует — не генерирует суммы |
-| Шифрование БД at-rest | 🚫 неприменимо | self-host dev-окружение; в прод — на уровне инфраструктуры, вне кода |
+| Ограниченная поверхность внешних API | ✅ | интеграции фиксированы: Telegram, OpenRouter (включая точечный online search) и ProverkaCheka; произвольного URL-fetch tool нет |
+| Маскирование имён (PERSON-NER) | ⏳ | требует тяжёлой `ru_core_news_md`; осознанно отложено (см. SECURITY.md) |
+| Трансграничная передача (ФЗ-152) | ⏳ | OpenRouter — зарубежные провайдеры; для прод-ФЗ-152 нужен локальный инференс |
+| Rate-limiting / anti-DoS | ⏳ | single-family дипломный бот за allowlist; не приоритет до публичного деплоя |
+| Output-guardrail на «галлюцинацию чисел» | 🚫 | числа берутся из SQL-агрегатов, LLM лишь формулирует — не генерирует суммы |
+| Шифрование БД at-rest | 🚫 | self-host dev-окружение; в прод — на уровне инфраструктуры, вне кода |
 
-## Документация
+## Метрики
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — слои, граница domain/application/infrastructure, пирамида памяти
-- [docs/SECURITY.md](docs/SECURITY.md) — маскирование PII, injection guard, чек-лист ФЗ-152
-- [docs/adr/](docs/adr/) — Architecture Decision Records (LangGraph, LangFuse, OpenRouter, MCP)
+| Метрика | Значение | Как измеряется |
+|---|---|---|
+| Success rate (evals) | **100%** (29/29) | доля `pass` по 29 кейсам, `just eval` (pytest-гейт, все скореры вкл. llm_judge): categorization 11, cascade 3, csv 2, security 3, routing 4, multi-intent 6. `just eval-report` дублирует детерминированный субсет в LangFuse Dataset Run для дашборда |
+| Latency median (per run) | **≈1.5 с** | медиана длительности `graph.ainvoke` по 12 запросам core-пути (steady-state); стабильна между прогонами (1.45 / 1.66 с) — это стоимость графа + типичного ответа LLM |
+| Latency p95 (per run) | **≈23 с** | p95 по тем же 12 запросам; воспроизводимо высок (22.6 / 23.2 с), но определяется хвостом латентности LLM-провайдера (`gemini-flash`/OpenRouter), не графом |
+| Cost per run (avg) | **≈$0.0002** | стоимость трейса (едет автоматически через callback), диапазон $0–$0.0005, worker `gemini-2.5-flash` |
 
-## Лицензия
+## Licensing
 
-[MIT](LICENSE) © 2026 Yuri
+MIT.
