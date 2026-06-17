@@ -1,14 +1,14 @@
 # Evals
 
-29 кейсов в YAML, разбитых по агентам. Два способа прогона — быстрый pytest-гейт
+31 кейс в YAML, разбитый по агентам. Два способа прогона — быстрый pytest-гейт
 и полноценный эксперимент с заливкой в LangFuse для дашборда.
 
 ## Три типа проверок (требование диплома)
 
 | Тип | Скорер | Где |
 |---|---|---|
-| Программный ассерт | `exact_match`, `threshold` | categorization, csv_parsing, security |
-| LLM-as-judge | `llm_judge` | categorization (разумна ли категория для мерчанта) |
+| Программный ассерт | `exact_match`, `threshold`, `contains_any` | categorization, csv_parsing, security, coach (grounding: число/дата из инструмента) |
+| LLM-as-judge | `llm_judge` | categorization (разумна ли категория), coach (по делу ли ответ) |
 | Корректность tool-вызова | `tool_call` | tool_routing (supervisor → правильная нода) |
 
 ## Кейсы
@@ -20,14 +20,16 @@ tests/evals/cases/
 ├── csv_parsing/      #  2 — TinkoffCsvParser (детерминированно)
 ├── security/         #  3 — injection guard (2 детерм. паттерна + 1 семантический)
 ├── tool_routing/     #  4 — supervisor routing, tool_call по выбранной ноде
-└── multi_intent/     #  6 — Send-веер план (4 exact_match + 2 llm_judge)
+├── multi_intent/     #  6 — Send-веер план (4 exact_match + 2 llm_judge)
+└── coach/            #  2 — качество ответа coach (ReAct+MCP, live DB): contains_any + llm_judge
 ```
 
-> `just eval` (pytest-гейт) гоняет все 29 кейсов и даёт полный success rate.
+> `just eval` (pytest-гейт) гоняет все 31 кейс и даёт полный success rate.
 > `just eval-report` (LangFuse) скорит детерминированный субсет 23 кейса
-> (categorization 11, cascade*, csv 2, security 3, tool_routing 4); multi_intent
-> и async-llm_judge — только в pytest-гейте. *cascade в LangFuse-раннере пока
-> падает на конкуренции asyncpg (см. BACKLOG), в pytest-гейте проходит.
+> (categorization 11, cascade*, csv 2, security 3, tool_routing 4); multi_intent,
+> coach и async-llm_judge — только в pytest-гейте. *cascade в LangFuse-раннере
+> пока падает на конкуренции asyncpg (см. BACKLOG), в pytest-гейте проходит.
+> coach сеет live-историю и ходит в MCP, поэтому только в pytest-гейте.
 
 Формат кейса — см. `.claude/skills/eval-writer/SKILL.md` и любой `*.yaml`.
 

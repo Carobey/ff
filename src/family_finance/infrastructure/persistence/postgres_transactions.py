@@ -8,6 +8,7 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from datetime import date, datetime
 from decimal import Decimal
+from typing import cast
 
 import asyncpg
 
@@ -18,6 +19,7 @@ from family_finance.domain import (
     BudgetStatus,
     Category,
     Direction,
+    Family,
     SavingsGoal,
     Subscription,
     Transaction,
@@ -101,8 +103,8 @@ _AGG_ORDER_SQL: dict[str, str] = {
     "total": "bucket ASC",
 }
 _LIST_ORDER_SQL: dict[str, str] = {
-    "date_desc": "occurred_at DESC",
-    "amount_desc": "amount DESC",
+    "date_desc": '"transaction".occurred_at DESC',
+    "amount_desc": '"transaction".amount DESC',
 }
 
 
@@ -111,6 +113,42 @@ class PostgresTransactionRepository:
 
     def __init__(self, dsn: str | None = None) -> None:
         self._dsn = dsn or get_settings().database_url.get_secret_value()
+
+    async def list_families(self) -> list[Family]:
+        """Return all families, oldest first, for local read-only UIs."""
+        pool = await _get_pool(self._dsn)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT family_id, name, created_at
+                FROM family
+                ORDER BY created_at ASC
+                """,
+            )
+        return [
+            Family(
+                family_id=row["family_id"],
+                name=row["name"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def get_primary_member_id(self, *, family_id: uuid.UUID) -> uuid.UUID | None:
+        """Return the oldest member for a family, or None when the family is empty."""
+        pool = await _get_pool(self._dsn)
+        async with pool.acquire() as conn:
+            member_id = await conn.fetchval(
+                """
+                SELECT member_id
+                FROM family_member
+                WHERE family_id = $1
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                family_id,
+            )
+        return cast("uuid.UUID | None", member_id)
 
     async def ensure_member_for_telegram(
         self,
@@ -266,6 +304,7 @@ class PostgresTransactionRepository:
         start: datetime | None = None,
         end: datetime | None = None,
         limit: int = 100,
+        merchant_query: str | None = None,
     ) -> list[LedgerBucket]:
         """Grouped sums over a flexible dimension. See port docstring.
 
@@ -296,6 +335,7 @@ class PostgresTransactionRepository:
                 start=start,
                 end=end,
                 safe_limit=safe_limit,
+                merchant_query=merchant_query,
             )
 
         sql = f"""
@@ -310,13 +350,16 @@ class PostgresTransactionRepository:
               AND ($3::TEXT[] IS NULL OR direction = ANY($3::TEXT[]))
               AND ($4::TIMESTAMPTZ IS NULL OR occurred_at >= $4)
               AND ($5::TIMESTAMPTZ IS NULL OR occurred_at < $5)
+              AND ($6::TEXT IS NULL OR merchant_raw ILIKE '%' || $6 || '%')
             GROUP BY bucket
             ORDER BY {order_expr}
-            LIMIT $6
+            LIMIT $7
         """
         pool = await _get_pool(self._dsn)
         async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, family_id, cat_filter, dir_filter, start, end, safe_limit)
+            rows = await conn.fetch(
+                sql, family_id, cat_filter, dir_filter, start, end, merchant_query, safe_limit
+            )
         return [
             LedgerBucket(
                 bucket=str(row["bucket"]),
@@ -337,6 +380,7 @@ class PostgresTransactionRepository:
         start: datetime | None,
         end: datetime | None,
         safe_limit: int,
+        merchant_query: str | None = None,
     ) -> list[LedgerBucket]:
         """Two-dimensional grouped sums (``group_by`` + ``then_by``).
 
@@ -361,13 +405,16 @@ class PostgresTransactionRepository:
               AND ($3::TEXT[] IS NULL OR direction = ANY($3::TEXT[]))
               AND ($4::TIMESTAMPTZ IS NULL OR occurred_at >= $4)
               AND ($5::TIMESTAMPTZ IS NULL OR occurred_at < $5)
+              AND ($6::TEXT IS NULL OR merchant_raw ILIKE '%' || $6 || '%')
             GROUP BY bucket, subbucket
             ORDER BY bucket ASC, COALESCE(SUM(amount), 0) DESC
-            LIMIT $6
+            LIMIT $7
         """
         pool = await _get_pool(self._dsn)
         async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, family_id, cat_filter, dir_filter, start, end, safe_limit)
+            rows = await conn.fetch(
+                sql, family_id, cat_filter, dir_filter, start, end, merchant_query, safe_limit
+            )
         return [
             LedgerBucket(
                 bucket=str(row["bucket"]),
@@ -388,8 +435,16 @@ class PostgresTransactionRepository:
         end: datetime | None = None,
         order_by: str = "date_desc",
         limit: int = 20,
+        merchant: str | None = None,
+        merchant_query: str | None = None,
     ) -> list[LedgerEntry]:
-        """Raw transaction rows, newest-first or biggest-first (``order_by``)."""
+        """Raw transaction rows, newest-first or biggest-first (``order_by``).
+
+        ``merchant`` is an exact match on the displayed merchant bucket (used by
+        the dashboard drill-down); ``merchant_query`` is a case-insensitive
+        substring filter (``merchant_raw ILIKE %…%``) used by the ledger node to
+        scope a free-text «расходы на <продавец>» question to one merchant.
+        """
         order_expr = _LIST_ORDER_SQL.get(order_by)
         if order_expr is None:
             raise ValueError(f"unsupported order_by: {order_by!r}")
@@ -399,7 +454,7 @@ class PostgresTransactionRepository:
         safe_limit = max(1, min(int(limit), 200))
 
         # order_expr is a whitelisted fragment (see _LIST_ORDER_SQL); all filter
-        # values are bound parameters ($1..$6) — nothing user-supplied interpolated.
+        # values are bound parameters ($1..$8) — nothing user-supplied interpolated.
         sql = f"""
             SELECT
                 occurred_at,
@@ -413,12 +468,24 @@ class PostgresTransactionRepository:
               AND ($3::TEXT[] IS NULL OR direction = ANY($3::TEXT[]))
               AND ($4::TIMESTAMPTZ IS NULL OR occurred_at >= $4)
               AND ($5::TIMESTAMPTZ IS NULL OR occurred_at < $5)
+              AND ($6::TEXT IS NULL OR COALESCE(NULLIF(merchant_raw, ''), '(без продавца)') = $6)
+              AND ($7::TEXT IS NULL OR merchant_raw ILIKE '%' || $7 || '%')
             ORDER BY {order_expr}
-            LIMIT $6
+            LIMIT $8
         """
         pool = await _get_pool(self._dsn)
         async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, family_id, cat_filter, dir_filter, start, end, safe_limit)
+            rows = await conn.fetch(
+                sql,
+                family_id,
+                cat_filter,
+                dir_filter,
+                start,
+                end,
+                merchant,
+                merchant_query,
+                safe_limit,
+            )
         return [
             LedgerEntry(
                 occurred_at=row["occurred_at"],
@@ -712,27 +779,6 @@ class PostgresTransactionRepository:
             )
             for row in rows
         ]
-
-    async def iter_telegram_families(self) -> list[tuple[uuid.UUID, int]]:
-        """Return (family_id, telegram_user_id) pairs for every linked family.
-
-        Used by the scheduler to know which chats to push the weekly digest
-        into. In private Telegram chats ``chat_id == user_id``, which is the
-        case we currently support.
-        """
-        pool = await _get_pool(self._dsn)
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT DISTINCT ON (family_id)
-                    family_id,
-                    telegram_user_id
-                FROM family_member
-                WHERE telegram_user_id IS NOT NULL
-                ORDER BY family_id, created_at ASC
-                """,
-            )
-        return [(row["family_id"], row["telegram_user_id"]) for row in rows]
 
     async def category_breakdown(
         self,

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import re
 import uuid
-from dataclasses import dataclass
+import zoneinfo
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal, cast
@@ -30,11 +31,21 @@ from family_finance.agents.ledger_terms import (
 )
 from family_finance.agents.state import FinanceState, SectionResult
 from family_finance.application.ports import LedgerSummary
-from family_finance.domain import Category, Direction
+from family_finance.domain import Category, Direction, normalize_merchant
 from family_finance.infrastructure.llm import get_chat_model
 from family_finance.infrastructure.mcp import call_finance_tool
 
 logger = structlog.get_logger()
+
+_MOSCOW = zoneinfo.ZoneInfo("Europe/Moscow")
+
+# Знак операции для построчного рендера: расход / доход / перевод-возврат.
+_DIRECTION_MARK: dict[str, str] = {
+    "expense": "🔻",
+    "income": "🟢",
+    "transfer": "↔️",
+    "refund": "↩️",
+}
 
 
 @dataclass(frozen=True)
@@ -45,6 +56,9 @@ class LedgerQuery:
     period_label: str
     start: datetime | None = None
     end: datetime | None = None
+    # Normalized merchant needle («ivi ru») when the question names a продавец;
+    # threaded to MCP as `merchant_query` to scope every row to that merchant.
+    merchant: str | None = None
 
 
 def is_ledger_question(text: str) -> bool:
@@ -229,12 +243,17 @@ _BREAKDOWN_KEYWORDS: tuple[str, ...] = (
     "по магазин",
     "у кого",
     "покажи",
+    "пакажи",
     "списк",
     "последни",
     "топ",
     "крупн",
     "больш",
     "операци",
+    "построчн",
+    "детальн",
+    "детально",
+    "подробн",
 )
 
 
@@ -242,6 +261,88 @@ def _wants_breakdown(text: str) -> bool:
     """Есть ли в вопросе явный триггер разбивки или списка операций."""
     normalized = text.lower()
     return any(kw in normalized for kw in _BREAKDOWN_KEYWORDS)
+
+
+# Явная просьба показать операции построчно — форсим mode=list (не суммы).
+_LIST_KEYWORDS: tuple[str, ...] = (
+    "построчн",
+    "детальн",
+    "детально",
+    "подробн",
+    "списк",
+    "последни",
+    "покажи",
+    "пакажи",
+    "операци",
+)
+
+
+def _wants_list(text: str) -> bool:
+    """Просит ли пользователь показать отдельные операции (а не сводку)."""
+    normalized = text.lower()
+    return any(kw in normalized for kw in _LIST_KEYWORDS)
+
+
+# Гео/постфиксы карточных дескрипторов («IVI.RU MOSCOW RUS») — не имена продавцов.
+_MERCHANT_NOISE: frozenset[str] = frozenset(
+    {"moscow", "mosc", "msk", "rus", "russia", "rf", "spb", "com", "www"}
+)
+
+
+def _brand_tokens(raw: str) -> list[str]:
+    """Значимые токены имени продавца: ≥3 символов, не число, не гео-шум."""
+    return [
+        tok
+        for tok in normalize_merchant(raw).split()
+        if len(tok) >= 3 and not tok.isdigit() and tok not in _MERCHANT_NOISE
+    ]
+
+
+async def _resolve_merchant(
+    family_id: uuid.UUID,
+    user_text: str,
+) -> tuple[str, str] | None:
+    """Сопоставить вопрос с реальным продавцом семьи → (needle, display) | None.
+
+    Берём реальных продавцов из БД (group_by=merchant) и сверяем их с текстом
+    вопроса, а не вытаскиваем имя регексом — так «расходы на IVI.RU» не спутать с
+    «расходы на еду». Совпадение — когда ХОТЯ БЫ ОДИН бренд-токен продавца есть в
+    вопросе (карточные «IVI.RU MOSCOW RUS» содержат гео-шум, поэтому требовать ВСЕ
+    токены нельзя). Из совпавших берём самого «дорогого». Возврат: needle —
+    отличительный токен для SQL-фильтра (`merchant_raw ILIKE %needle%`) и исходное
+    имя продавца для подписи ответа.
+    """
+    question_tokens = set(_brand_tokens(user_text))
+    if not question_tokens:
+        return None
+    try:
+        rows = await call_finance_tool(
+            "query_aggregates",
+            {
+                "family_id": str(family_id),
+                "group_by": "merchant",
+                "directions": [Direction.EXPENSE.value],
+                "limit": 1000,
+            },
+        )
+    except Exception:
+        logger.warning("ledger_merchant_resolve_failed")
+        return None
+
+    best: tuple[int, Decimal, str, str] | None = None
+    for row in rows:
+        display = str(row["bucket"])
+        overlap = [tok for tok in _brand_tokens(display) if tok in question_tokens]
+        if not overlap:
+            continue
+        total = Decimal(str(row["total"]))
+        needle = max(overlap, key=len)  # самый длинный → отличительный для ILIKE
+        score = (len(overlap), total)
+        if best is None or score > (best[0], best[1]):
+            best = (len(overlap), total, needle, display)
+    if best is None:
+        return None
+    return best[2], best[3]
 
 
 async def ledger_node(state: FinanceState) -> dict[str, object]:
@@ -272,8 +373,19 @@ async def ledger_node(state: FinanceState) -> dict[str, object]:
         }
 
     family_id = uuid.UUID(state["family_id"])
+
+    # Вопрос про конкретного продавца («расходы на IVI.RU») — сужаем все строки
+    # к этому мерчанту, иначе catch-all «все расходы» вернёт траты по всем.
+    resolved = await _resolve_merchant(family_id, user_text)
+    if resolved is not None:
+        needle, display = resolved
+        query = replace(query, merchant=needle, label=f"расходы на {display}")
+
     shape = await _extract_query_shape(user_text)
-    if not _wants_breakdown(user_text):
+    if resolved is not None and _wants_list(user_text):
+        # «покажи/построчно/детально расходы на <продавец>» — список операций.
+        shape = QueryShape(mode="list", order_by=shape.order_by, limit=shape.limit)
+    elif not _wants_breakdown(user_text):
         # Голый «сколько за <период>» — одно число, без дрейфа shape: LLM иногда
         # отдаёт group_by=category (таблицу) вместо ответа. Форсим total (QA-02).
         shape = QueryShape()
@@ -353,6 +465,7 @@ async def _total_via_mcp(
             "directions": [d.value for d in query.directions],
             "start": start.isoformat() if start else None,
             "end": end.isoformat() if end else None,
+            "merchant_query": query.merchant,
         },
     )
     if not rows:
@@ -378,6 +491,7 @@ async def _grouped_via_mcp(
             "start": query.start.isoformat() if query.start else None,
             "end": query.end.isoformat() if query.end else None,
             "limit": limit,
+            "merchant_query": query.merchant,
         },
     )
     return [(str(r["bucket"]), Decimal(str(r["total"])), int(r["count"])) for r in rows]
@@ -402,6 +516,7 @@ async def _grouped_2d_via_mcp(
             "start": query.start.isoformat() if query.start else None,
             "end": query.end.isoformat() if query.end else None,
             "limit": limit,
+            "merchant_query": query.merchant,
         },
     )
     return [
@@ -426,6 +541,7 @@ async def _list_via_mcp(
             "end": query.end.isoformat() if query.end else None,
             "order_by": order_by,
             "limit": limit,
+            "merchant_query": query.merchant,
         },
     )
     return list(rows)
@@ -438,6 +554,9 @@ _NARRATIVE_SYSTEM = """\
 - Сумму пиши с пробелами-разделителями тысяч: «28 881 ₽», а не «28881₽»
 - Если есть данные за предыдущий период — сравни: «на 12% меньше, чем в апреле»
 - Если данных нет (count=0) — скажи что транзакций не найдено за этот период
+- Явно укажи, что суммируются именно расходы или доходы (см. «Тип сумм»)
+- Явно назови период из строки «Период» («за май», «за всё время»), чтобы число
+  не читалось как другой срез — иначе цифры по разным окнам не сходятся (QA-10)
 - Не придумывай числа — используй только те, что даны
 """
 
@@ -463,6 +582,7 @@ async def _narrative_llm(
     facts = (
         f"Вопрос пользователя: «{user_question}»\n"
         f"Категория запроса: {query.label}\n"
+        f"Тип сумм: {_summed_noun(query.directions)}\n"
         f"Период: {query.period_label}\n"
         f"Текущий период: {_fmt_money(_round_rub(current.total))}, {current.count} операций."
         f"{prev_block}"
@@ -536,6 +656,15 @@ def _fmt_money(rubles: int) -> str:
     return f"{rubles:,}".replace(",", " ") + " ₽"
 
 
+def _summed_noun(directions: tuple[Direction, ...]) -> str:
+    """Что именно суммируется в итоге — чтобы число не читалось двусмысленно."""
+    if directions == (Direction.INCOME,):
+        return "доходы"
+    if directions == (Direction.EXPENSE,):
+        return "расходы"
+    return "операции"
+
+
 def _bucket_label(group_by: str, bucket: str) -> str:
     """Human label for one aggregation bucket key."""
     if group_by == "day":
@@ -570,7 +699,7 @@ def _render_grouped(
         rubles = _round_rub(amount)
         total += rubles
         lines.append(f"• {_bucket_label(group_by, bucket)}: {_fmt_money(rubles)}")
-    lines.append(f"Итого: {_fmt_money(total)}")
+    lines.append(f"Итого ({_summed_noun(query.directions)}): {_fmt_money(total)}")
     return "\n".join(lines)
 
 
@@ -599,7 +728,7 @@ def _render_grouped_2d(
         lines.append(f"{_bucket_label(group_by, bucket)} — {_fmt_money(bucket_total)}:")
         for subbucket, rubles in subrows:
             lines.append(f"  • {_bucket_label(then_by, subbucket)}: {_fmt_money(rubles)}")
-    lines.append(f"Итого: {_fmt_money(grand_total)}")
+    lines.append(f"Итого ({_summed_noun(query.directions)}): {_fmt_money(grand_total)}")
     return "\n".join(lines)
 
 
@@ -610,12 +739,13 @@ def _render_list(query: LedgerQuery, entries: list[dict[str, object]]) -> str:
     lines = [f"{query.label.capitalize()} {query.period_label} — операции:"]
     total = 0
     for entry in entries:
-        occurred = datetime.fromisoformat(str(entry["occurred_at"]))
+        occurred = datetime.fromisoformat(str(entry["occurred_at"])).astimezone(_MOSCOW)
         rubles = _round_rub(Decimal(str(entry["amount"])))
         total += rubles
         merchant = str(entry["merchant"]) or "—"
-        lines.append(f"• {occurred.day:02d}.{occurred.month:02d} {merchant}: {_fmt_money(rubles)}")
-    lines.append(f"Итого показано: {_fmt_money(total)}")
+        mark = _DIRECTION_MARK.get(str(entry["direction"]), "")
+        lines.append(f"• {occurred:%d.%m %H:%M} {mark} {merchant}: {_fmt_money(rubles)}")
+    lines.append(f"Итого показано ({_summed_noun(query.directions)}): {_fmt_money(total)}")
     return "\n".join(lines)
 
 
@@ -651,12 +781,15 @@ def _parse_period(
     if date_range is not None:
         return date_range
 
-    if any(token in normalized for token in ("этот месяц", "текущий месяц")):
+    if any(
+        token in normalized
+        for token in ("этот месяц", "этом месяц", "текущий месяц", "текущем месяц")
+    ):
         start = _month_start(effective_now.year, effective_now.month)
         end = _next_month_start(effective_now.year, effective_now.month)
         return start, end, f"за {effective_now.month:02d}.{effective_now.year}"
 
-    if "прошлый месяц" in normalized:
+    if any(token in normalized for token in ("прошлый месяц", "прошлом месяц")):
         previous_year, previous_month = _previous_month(effective_now.year, effective_now.month)
         start = _month_start(previous_year, previous_month)
         end = _next_month_start(previous_year, previous_month)

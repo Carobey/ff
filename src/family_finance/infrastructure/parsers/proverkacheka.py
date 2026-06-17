@@ -136,8 +136,11 @@ def _parse_datetime(raw: str) -> datetime:
             return dt.replace(tzinfo=UTC)
         except ValueError:
             pass
-    # ФНС compact: 20260502T1234 or 20260502T123456
-    for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
+    # ФНС compact: 20260502T1234 or 20260502T123456. Пробуем без секунд ПЕРВЫМ:
+    # strptime со «%H%M%S» рыхло матчит 4-значное время «1234» как 12:03:04,
+    # поэтому короткий формат должен иметь приоритет (6-значное «123456» его не
+    # пройдёт — останется «56» — и корректно уедет в формат с секундами).
+    for fmt in ("%Y%m%dT%H%M", "%Y%m%dT%H%M%S"):
         try:
             dt = datetime.strptime(raw, fmt)
             return dt.replace(tzinfo=UTC)

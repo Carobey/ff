@@ -63,9 +63,11 @@ def _trace_config(family_id: uuid.UUID) -> RunnableConfig:
 def _week_window(now: datetime | None = None) -> tuple[datetime, datetime]:
     """Return [start, end) for the most recently completed Mon..Sun week."""
     now = now or datetime.now(_MOSCOW)
-    # Week starts Monday in Russia. We summarise the week that just ended,
-    # so end = upcoming Monday 00:00, start = end - 7 days.
-    end_local = (now + timedelta(days=(7 - now.weekday()) % 7 or 7)).replace(
+    # Week starts Monday in Russia. We summarise the week that just ended:
+    # end = the Monday boundary closing the current week (today 00:00 when now
+    # is already Monday — без `or 7`, иначе в пн окно прыгало на неделю вперёд,
+    # QA-12), start = end - 7 days.
+    end_local = (now + timedelta(days=(7 - now.weekday()) % 7)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
     start_local = end_local - timedelta(days=7)

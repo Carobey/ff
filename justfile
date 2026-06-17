@@ -51,6 +51,9 @@ reset-data:
 run:
     uv run python -m family_finance.bot
 
+web port="8000":
+    uv run uvicorn family_finance.web.app:app --host 127.0.0.1 --port {{port}} --reload
+
 # Запустить MCP-сервер (read-only финанс-инструменты) поверх stdio — для Claude Desktop / внешних агентов
 mcp:
     uv run python -m family_finance.mcp_server.server

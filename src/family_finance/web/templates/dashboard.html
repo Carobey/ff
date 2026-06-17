@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Family Finance · Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+    <script id="dashboard-data" type="application/json">{{ chart_payload | tojson }}</script>
+    <script defer src="/static/dashboard.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Family Finance</p>
+        <h1>Финансовая панель</h1>
+      </div>
+      <div class="topbar__actions">
+        <a class="icon-button" href="/" aria-label="Обновить dashboard" title="Обновить">↻</a>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="context-row" aria-label="Контекст">
+        <div>
+          <span class="context-row__label">Период</span>
+          <strong id="context-period">{{ dashboard.period_label }}</strong>
+        </div>
+        <div>
+          <span class="context-row__label">Данные</span>
+          <strong id="context-generated">{{ dashboard.generated_at }}</strong>
+        </div>
+        {% if dashboard.selected_family_name %}
+          <div>
+            <span class="context-row__label">Срез</span>
+            <strong id="context-family">{{ dashboard.selected_family_name }}</strong>
+          </div>
+        {% endif %}
+      </section>
+
+      {% if dashboard.families %}
+        <form class="control-panel" id="dashboard-filters">
+          <label>
+            <span>Семья</span>
+            <select name="family_id">
+              {% for family in dashboard.families %}
+                <option
+                  value="{{ family.family_id }}"
+                  {% if family.family_id == dashboard.selected_family_id %}selected{% endif %}
+                >
+                  {{ family.name }}
+                </option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            <span>Период</span>
+            <select name="period">
+              {% for option in dashboard.period_options %}
+                <option value="{{ option.value }}" {% if option.value == dashboard.filters.period %}selected{% endif %}>
+                  {{ option.label }}
+                </option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            <span>С</span>
+            <input type="date" name="start_date" value="{{ dashboard.filters.start_date }}">
+          </label>
+          <label>
+            <span>По</span>
+            <input type="date" name="end_date" value="{{ dashboard.filters.end_date }}">
+          </label>
+          <label>
+            <span>Категория</span>
+            <select name="category">
+              {% for option in dashboard.category_options %}
+                <option value="{{ option.value }}" {% if option.value == dashboard.filters.category %}selected{% endif %}>
+                  {{ option.label }}
+                </option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            <span>Движение</span>
+            <select name="direction">
+              {% for option in dashboard.direction_options %}
+                <option value="{{ option.value }}" {% if option.value == dashboard.filters.direction %}selected{% endif %}>
+                  {{ option.label }}
+                </option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            <span>Группировка</span>
+            <select name="group_by">
+              {% for option in dashboard.group_options %}
+                <option value="{{ option.value }}" {% if option.value == dashboard.filters.group_by %}selected{% endif %}>
+                  {{ option.label }}
+                </option>
+              {% endfor %}
+            </select>
+          </label>
+          <div class="control-actions">
+            <button class="primary-button" type="submit">Применить</button>
+            <button class="ghost-button" type="button" id="filters-reset">Сбросить</button>
+          </div>
+        </form>
+        <p class="filter-error" id="filter-error" role="alert" hidden></p>
+      {% endif %}
+
+      {% if dashboard.empty_state %}
+        <section class="empty-state">
+          <h2>Нет данных для панели</h2>
+          <p>{{ dashboard.empty_state }}</p>
+        </section>
+      {% else %}
+        <section class="metric-grid" id="metric-grid" aria-label="Ключевые показатели">
+          {% for metric in dashboard.metrics %}
+            <article class="metric metric--{{ metric.tone }}">
+              <span>{{ metric.label }}</span>
+              <strong>{{ metric.value }}</strong>
+              <small>{{ metric.detail }}</small>
+              <em>{{ metric.trend }}</em>
+            </article>
+          {% endfor %}
+        </section>
+
+        <section class="dashboard-grid dashboard-grid--wide">
+          <div class="panel panel--chart">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Динамика</p>
+                <h2>Доходы и расходы по дням</h2>
+              </div>
+            </div>
+            <div class="chart" id="daily-chart" aria-label="График доходов и расходов по дням">
+              <div class="chart__empty">Нет операций за период</div>
+            </div>
+            <div class="legend">
+              <span><i class="legend__income"></i>Доходы</span>
+              <span><i class="legend__expense"></i>Расходы</span>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Категории</p>
+                <h2 id="breakdown-title">Детализация</h2>
+              </div>
+            </div>
+            <div class="stack-list" id="breakdown-list">
+              {% if dashboard.categories %}
+                {% for item in dashboard.categories %}
+                  <article
+                    class="row-item row-item--clickable"
+                    data-breakdown-item
+                    data-bucket="{{ item.bucket }}"
+                    data-group-by="{{ item.group_by }}"
+                  >
+                    <div class="row-item__main">
+                      <strong>{{ item.label }}</strong>
+                      <span>{{ item.count }} операций · {{ item.pct }}%</span>
+                    </div>
+                    <div class="row-item__amount">{{ item.total }}</div>
+                    <div class="progress" aria-label="{{ item.label }} {{ item.pct }}%">
+                      <span style="width: {{ item.bar_pct }}%"></span>
+                    </div>
+                  </article>
+                {% endfor %}
+              {% else %}
+                <p class="muted" id="breakdown-empty">Данных по выбранным параметрам нет.</p>
+              {% endif %}
+            </div>
+          </div>
+        </section>
+
+        <section class="panel panel--agent">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Агент</p>
+              <h2>Финансовый вопрос</h2>
+            </div>
+          </div>
+          <form class="agent-form" id="agent-form">
+            <textarea
+              name="question"
+              rows="3"
+              placeholder="Например: проверь расходы, бюджеты, подписки и дай рекомендации"
+            ></textarea>
+            <button class="primary-button" type="submit">Спросить</button>
+          </form>
+          <small class="muted agent-hint">Ctrl / ⌘ + Enter — отправить</small>
+          <div class="agent-answer" id="agent-answer" aria-live="polite"></div>
+          <div class="quick-prompts">
+            <button type="button" data-prompt="Проверь расходы, бюджеты и подписки за выбранный период, дай рекомендации">Расходы + советы</button>
+            <button type="button" data-prompt="На чём можно сэкономить в этом месяце?">Экономия</button>
+            <button type="button" data-prompt="Какие регулярные списания выглядят подозрительно?">Подписки</button>
+          </div>
+        </section>
+
+        <section class="dashboard-grid">
+          <div class="panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Бюджеты</p>
+                <h2>Лимиты месяца</h2>
+              </div>
+            </div>
+            {% if dashboard.budgets %}
+              <div class="stack-list" id="budget-list">
+                {% for budget in dashboard.budgets %}
+                  <article class="row-item row-item--status-{{ budget.status }}">
+                    <div class="row-item__main">
+                      <strong>{{ budget.label }}</strong>
+                      <span>{{ budget.spent }} из {{ budget.limit }}</span>
+                    </div>
+                    <div class="status-pill status-pill--{{ budget.status }}">
+                      {{ budget.status_label }} · {{ budget.pct }}%
+                    </div>
+                    <div class="progress progress--{{ budget.status }}">
+                      <span style="width: {{ budget.bar_pct }}%"></span>
+                    </div>
+                  </article>
+                {% endfor %}
+              </div>
+            {% else %}
+              <div class="stack-list" id="budget-list">
+                <p class="muted">Бюджеты ещё не настроены.</p>
+              </div>
+            {% endif %}
+          </div>
+
+          <div class="panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Подписки</p>
+                <h2>Регулярные списания</h2>
+              </div>
+              <strong class="section-total" id="subscriptions-total">
+                {{ dashboard.subscriptions_total }} / мес
+              </strong>
+            </div>
+            {% if dashboard.subscriptions %}
+              <div class="stack-list" id="subscription-list">
+                {% for sub in dashboard.subscriptions %}
+                  <article class="row-item">
+                    <div class="row-item__main">
+                      <strong>{{ sub.merchant }}</strong>
+                      <span>{{ sub.category }} · {{ sub.cadence }} · последнее {{ sub.last_seen }}</span>
+                    </div>
+                    <div class="row-item__amount">
+                      {{ sub.monthly }}
+                      <small>{{ sub.last_amount }}</small>
+                    </div>
+                  </article>
+                {% endfor %}
+              </div>
+            {% else %}
+              <div class="stack-list" id="subscription-list">
+                <p class="muted">Регулярных списаний за последний год не найдено.</p>
+              </div>
+            {% endif %}
+          </div>
+        </section>
+
+        <section class="dashboard-grid">
+          <div class="panel panel--goal" id="goal-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Цель</p>
+                <h2>Накопления</h2>
+              </div>
+              {% if dashboard.goal %}
+                <div class="status-pill status-pill--{{ dashboard.goal.status }}">
+                  {{ dashboard.goal.status_label }}
+                </div>
+              {% endif %}
+            </div>
+            {% if dashboard.goal %}
+              <div class="goal-meter">
+                <div>
+                  <span>Накоплено</span>
+                  <strong>{{ dashboard.goal.saved }}</strong>
+                  <small>из {{ dashboard.goal.target }}</small>
+                </div>
+                <b>{{ dashboard.goal.pct }}%</b>
+              </div>
+              <div class="progress progress--goal">
+                <span style="width: {{ dashboard.goal.bar_pct }}%"></span>
+              </div>
+              <dl class="facts">
+                <div>
+                  <dt>Осталось</dt>
+                  <dd>{{ dashboard.goal.remaining }}</dd>
+                </div>
+                <div>
+                  <dt>Дата</dt>
+                  <dd>{{ dashboard.goal.target_date }}</dd>
+                </div>
+                {% if dashboard.goal.monthly_needed %}
+                  <div>
+                    <dt>В месяц</dt>
+                    <dd>{{ dashboard.goal.monthly_needed }}</dd>
+                  </div>
+                {% endif %}
+              </dl>
+            {% else %}
+              <p class="muted">Цель накопления пока не задана.</p>
+            {% endif %}
+          </div>
+
+          <div class="panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Операции</p>
+                <h2 id="transaction-title">Последние движения</h2>
+              </div>
+            </div>
+            {% if dashboard.recent_transactions %}
+              <div class="transaction-list" id="transaction-list">
+                {% for tx in dashboard.recent_transactions %}
+                  <article class="transaction">
+                    <time>{{ tx.occurred_at }}</time>
+                    <div>
+                      <strong>{{ tx.merchant }}</strong>
+                      <span>{{ tx.category }} · {{ tx.direction }}</span>
+                    </div>
+                    <b class="amount amount--{{ tx.tone }}">{{ tx.amount }}</b>
+                  </article>
+                {% endfor %}
+              </div>
+            {% else %}
+              <p class="muted">Операций пока нет.</p>
+            {% endif %}
+          </div>
+        </section>
+      {% endif %}
+    </main>
+  </body>
+</html>

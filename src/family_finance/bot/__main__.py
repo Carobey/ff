@@ -22,6 +22,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand
 from aiohttp import AsyncResolver, ClientSession
 
 from family_finance.bot.handlers import register_all_handlers
@@ -31,6 +32,20 @@ from family_finance.infrastructure.memory import get_checkpointer
 from family_finance.infrastructure.memory.graphiti_client import graphiti_init
 from family_finance.infrastructure.observability import flush, get_langfuse
 from family_finance.infrastructure.settings import get_settings
+
+# Меню команд бота (синхронно с хендлерами в handlers/start.py).
+_BOT_COMMANDS: list[BotCommand] = [
+    BotCommand(command="start", description="Начало работы и помощь"),
+    BotCommand(command="subscriptions", description="Подписки и регулярные платежи"),
+    BotCommand(command="budgets", description="Бюджеты и траты за месяц"),
+    BotCommand(command="budget", description="Задать бюджет: /budget <категория> <сумма>"),
+    BotCommand(command="budget_off", description="Убрать бюджет по категории"),
+    BotCommand(command="goal", description="Цель накоплений: /goal <сумма> <дата>"),
+    BotCommand(command="goal_off", description="Убрать цель накоплений"),
+    BotCommand(command="digest", description="Прислать недельный дайджест сейчас"),
+    BotCommand(command="digest_schedule", description="Настроить расписание дайджеста"),
+    BotCommand(command="digest_off", description="Отключить дайджест"),
+]
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -113,6 +128,12 @@ async def amain() -> None:
         dp["settings"] = settings
 
         register_all_handlers(dp)
+
+        # Регистрируем меню команд (кнопка «/» в клиенте). Идемпотентно.
+        try:
+            await bot.set_my_commands(_BOT_COMMANDS)
+        except Exception:
+            log.warning("startup.set_commands_failed")
 
         log.info("startup.ready", bot=(await bot.get_me()).username)
 

@@ -328,8 +328,14 @@ async def supervisor_node(state: FinanceState) -> dict[str, object]:
 
     if is_tax_question(user_text):
         return {"current_intent": "tax"}
+    # «Сколько откладывать / копить на цель» несёт слабый ledger-токен «сколько»,
+    # но это совет, а не сводка трат. Перебиваем ledger advice'ом ТОЛЬКО когда нет
+    # сильного спенд-слова (потрат/траты/расход) — иначе «сколько потратил и стоит
+    # ли урезать траты» утекло бы в advice вместо сводки (QA-07).
     if is_ledger_question(user_text):
-        return {"current_intent": "query"}
+        strong_spend = any(w in user_text.lower() for w in ("потрат", "траты", "расход"))
+        if strong_spend or not is_advice_question(user_text):
+            return {"current_intent": "query"}
     if is_pattern_question(user_text):
         return {"current_intent": "pattern"}
     if is_subscriptions_question(user_text):

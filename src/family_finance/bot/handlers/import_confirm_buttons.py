@@ -88,4 +88,8 @@ async def handle_import_confirm(
         await bot.send_message(chat_id, "⚠️ Не смог завершить импорт. Подробности в логах.")
         return
 
-    await send_import_result(message, result)
+    # На отмене замороженная карточка («🛑 Импорт отменён.») уже и есть
+    # подтверждение — текст графа продублировал бы его второй репликой (QA-13).
+    # Дальнейших действий у отмены нет: ни вставок, ни уточнений.
+    if confirmed:
+        await send_import_result(message, result)

@@ -159,6 +159,7 @@ class TransactionRepository(Protocol):
         start: datetime | None = None,
         end: datetime | None = None,
         limit: int = 100,
+        merchant_query: str | None = None,
     ) -> list[LedgerBucket]:
         """Grouped sums over a flexible dimension (day/week/month/category/merchant/total).
 
@@ -181,8 +182,14 @@ class TransactionRepository(Protocol):
         end: datetime | None = None,
         order_by: str = "date_desc",
         limit: int = 20,
+        merchant: str | None = None,
+        merchant_query: str | None = None,
     ) -> list[LedgerEntry]:
-        """Raw transaction rows, newest-first or biggest-first (``order_by``)."""
+        """Raw transaction rows, newest-first or biggest-first (``order_by``).
+
+        ``merchant`` is an exact match on the merchant bucket; ``merchant_query``
+        is a normalized substring filter for free-text «расходы на <продавец>».
+        """
         ...
 
     async def classify_by_import_hashes(
@@ -196,8 +203,6 @@ class TransactionRepository(Protocol):
         confidence: float = 1.0,
         needs_review: bool | None = None,
     ) -> int: ...
-
-    async def iter_telegram_families(self) -> list[tuple[uuid.UUID, int]]: ...
 
     async def set_digest_cron(
         self,

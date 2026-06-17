@@ -21,6 +21,7 @@ from langchain_core.messages import (
     HumanMessage,
     RemoveMessage,
     SystemMessage,
+    ToolMessage,
 )
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
@@ -61,8 +62,18 @@ async def compact_node(state: FinanceState) -> dict[str, object]:
     if len(messages) <= _COMPACT_AFTER:
         return {}
 
-    older = messages[:-_KEEP_RECENT]
-    recent = messages[-_KEEP_RECENT:]
+    # Хвост не должен начинаться с осиротевшего ToolMessage: его инициирующий
+    # AIMessage (с tool_calls) ушёл бы в свёрнутую часть, и провайдер отклонит
+    # tool-result без предшествующего tool-call. Сдвигаем границу назад, пока
+    # хвост не начнётся с не-ToolMessage — так пара tool-call/result остаётся
+    # целой. Latent-гард: сегодня ReAct-циклы (advisor/coach) кладут в state
+    # только финальный ответ, ToolMessage в граф не попадают — страховка на
+    # случай, если начнут (PR-10).
+    split = len(messages) - _KEEP_RECENT
+    while split > 0 and isinstance(messages[split], ToolMessage):
+        split -= 1
+    older = messages[:split]
+    recent = messages[split:]
 
     model = get_chat_model(tier="worker")
     try:

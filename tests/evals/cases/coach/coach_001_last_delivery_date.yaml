@@ -1,0 +1,13 @@
+id: coach_001
+agent: coach
+description: "«Когда последний раз заказывал доставку» — ответ содержит дату из инструмента"
+tags: [coach, behavioral, grounding]
+input:
+  text: "Когда я последний раз заказывал доставку еды?"
+expected:
+  # Конкретные токены проставляет раннер из засеянной истории (дата зависит от seed).
+  kind: last_delivery_date
+scorers:
+  - type: contains_any
+    field: answer
+  - type: llm_judge

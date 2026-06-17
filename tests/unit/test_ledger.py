@@ -72,9 +72,35 @@ def test_parse_current_month_query() -> None:
 
 
 @pytest.mark.unit
+def test_parse_current_month_prepositional() -> None:
+    query = parse_ledger_query(
+        "сколько я потратил в этом месяце",
+        now=datetime(2026, 5, 28, tzinfo=UTC),
+    )
+
+    assert query is not None
+    assert query.start == datetime(2026, 5, 1, tzinfo=UTC)
+    assert query.end == datetime(2026, 6, 1, tzinfo=UTC)
+    assert query.period_label == "за 05.2026"
+
+
+@pytest.mark.unit
 def test_parse_previous_month_query() -> None:
     query = parse_ledger_query(
         "траты на еду за прошлый месяц",
+        now=datetime(2026, 5, 28, tzinfo=UTC),
+    )
+
+    assert query is not None
+    assert query.start == datetime(2026, 4, 1, tzinfo=UTC)
+    assert query.end == datetime(2026, 5, 1, tzinfo=UTC)
+    assert query.period_label == "за 04.2026"
+
+
+@pytest.mark.unit
+def test_parse_previous_month_prepositional() -> None:
+    query = parse_ledger_query(
+        "траты на еду в прошлом месяце",
         now=datetime(2026, 5, 28, tzinfo=UTC),
     )
 
@@ -134,7 +160,7 @@ def test_render_grouped_total_equals_sum_of_rows() -> None:
     rendered = _render_grouped(query, "day", buckets)
 
     assert "1 апреля: 1 000 ₽" in rendered
-    assert "Итого: 4 500 ₽" in rendered  # 1000 + 1500 + 2000, adds up exactly
+    assert "Итого (расходы): 4 500 ₽" in rendered  # 1000 + 1500 + 2000, adds up exactly
 
 
 @pytest.mark.unit
@@ -162,7 +188,7 @@ def test_render_grouped_2d_subtotals_and_total_add_up() -> None:
     assert "• Продукты: 2 000 ₽" in rendered
     assert "• Аптека: 1 000 ₽" in rendered
     assert "2 апреля — 1 500 ₽:" in rendered
-    assert "Итого: 4 500 ₽" in rendered  # 2000 + 1000 + 1500
+    assert "Итого (расходы): 4 500 ₽" in rendered  # 2000 + 1000 + 1500
 
 
 @pytest.mark.unit
@@ -234,7 +260,7 @@ async def test_ledger_node_2d_breakdown_uses_subbucket_rows(
     content = str(result["messages"][0].content)
     assert "1 апреля — 3 000 ₽:" in content
     assert "• Продукты: 2 000 ₽" in content
-    assert "Итого: 3 000 ₽" in content
+    assert "Итого (расходы): 3 000 ₽" in content
 
 
 @pytest.mark.unit
@@ -271,4 +297,70 @@ async def test_ledger_node_day_breakdown_uses_real_mcp_rows(
     content = str(result["messages"][0].content)
     assert "1 апреля: 1 000 ₽" in content
     assert "2 апреля: 1 500 ₽" in content
-    assert "Итого: 2 500 ₽" in content  # real sum, not a hallucinated total
+    assert "Итого (расходы): 2 500 ₽" in content  # real sum, not a hallucinated total
+
+
+@pytest.mark.unit
+async def test_ledger_node_scopes_list_to_named_merchant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """«построчно расходы на IVI.RU» → list, отфильтрованный по merchant_query."""
+
+    list_args: dict[str, Any] = {}
+
+    async def fake_shape(_question: str) -> QueryShape:
+        return QueryShape(mode="aggregate", group_by="total")
+
+    async def fake_call(name: str, arguments: dict[str, Any]) -> Any:
+        if name == "query_aggregates" and arguments.get("group_by") == "merchant":
+            # реальные продавцы семьи (карточный дескриптор с гео-шумом)
+            return [
+                {"bucket": "IVI.RU MOSCOW RUS", "total": "34928.00", "count": 15},
+                {"bucket": "Пятёрочка", "total": "5000.00", "count": 3},
+            ]
+        if name == "list_transactions":
+            list_args.update(arguments)
+            return [
+                {
+                    "occurred_at": "2026-04-10T12:00:00+00:00",
+                    "amount": "599.00",
+                    "direction": "expense",
+                    "category": "entertainment.subscriptions",
+                    "merchant": "IVI.RU MOSCOW RUS",
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(ledger_module, "_extract_query_shape", fake_shape)
+    monkeypatch.setattr(ledger_module, "call_finance_tool", fake_call)
+
+    result = await ledger_node(
+        {
+            "family_id": str(uuid.uuid4()),
+            "messages": [HumanMessage(content="пакажи построчно детальные расходы на IVI.RU")],
+        }
+    )
+
+    assert list_args["merchant_query"] == "ivi"  # отличительный бренд-токен, не гео-шум
+    content = str(result["messages"][0].content)
+    assert "расходы на ivi.ru" in content.lower()
+    assert "IVI.RU" in content  # имя продавца в строке операции сохранено как есть
+    assert "599 ₽" in content
+
+
+@pytest.mark.unit
+async def test_resolve_merchant_ignores_unrelated_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """«сколько на еду» не должно ложно матчиться на продавца (нет общих токенов)."""
+
+    async def fake_call(name: str, arguments: dict[str, Any]) -> Any:
+        if name == "query_aggregates" and arguments.get("group_by") == "merchant":
+            return [{"bucket": "IVI.RU", "total": "34928.00", "count": 15}]
+        return []
+
+    family_id = uuid.uuid4()
+    monkeypatch.setattr(ledger_module, "call_finance_tool", fake_call)
+
+    resolved = await ledger_module._resolve_merchant(family_id, "сколько на еду в мае")
+    assert resolved is None

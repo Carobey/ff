@@ -24,6 +24,12 @@ def threshold(value: float, op: str, threshold_val: float) -> float:
     return 1.0 if ops[op] else 0.0
 
 
+def contains_any(text: Any, tokens: Any) -> float:
+    """Return 1.0 iff ``text`` contains at least one of ``tokens`` (substring)."""
+    haystack = str(text)
+    return 1.0 if any(str(token) in haystack for token in (tokens or [])) else 0.0
+
+
 def apply_scorer(
     scorer_cfg: dict[str, Any],
     result: dict[str, Any],
@@ -35,6 +41,12 @@ def apply_scorer(
     if stype == "exact_match":
         field = scorer_cfg["field"]
         return exact_match(result.get(field), expected.get(field))
+
+    if stype == "contains_any":
+        # Grounding check: the answer must echo a number/date that came from a tool.
+        # ``expected[field]`` is the list of acceptable substrings (e.g. date variants).
+        field = scorer_cfg["field"]
+        return contains_any(result.get(field), expected.get(field))
 
     if stype == "threshold":
         field = scorer_cfg["field"]

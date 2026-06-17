@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from family_finance.agents import compaction as compaction_module
@@ -53,6 +53,49 @@ async def test_compact_summarizes_and_keeps_recent(monkeypatch: pytest.MonkeyPat
     kept = out[2:]
     assert len(kept) == keep
     assert [str(m.content) for m in kept] == [f"m{i}" for i in range(total - keep, total)]
+
+
+@pytest.mark.unit
+async def test_compact_keeps_tool_pair_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tail must not start with an orphaned ToolMessage (PR-10 guard).
+
+    If the -_KEEP_RECENT boundary lands on a ToolMessage, its initiating
+    AIMessage(tool_calls) would be summarized away, leaving a tool-result with
+    no preceding tool-call → provider rejects the next turn. The split must move
+    back so the pair stays together in the kept tail.
+    """
+
+    class _Resp:
+        content = "сводка"
+
+    class _Model:
+        async def ainvoke(self, *_a: object, **_k: object) -> _Resp:
+            return _Resp()
+
+    monkeypatch.setattr("family_finance.agents.compaction.get_chat_model", lambda *a, **k: _Model())
+
+    keep = compaction_module._KEEP_RECENT
+    total = compaction_module._COMPACT_AFTER + 5
+    boundary = total - keep  # index that would become recent[0]
+
+    messages: list[object] = [HumanMessage(content=f"m{i}") for i in range(total)]
+    # Put a tool-call/result pair straddling the boundary: AIMessage(tool_calls)
+    # just before it, the ToolMessage exactly on it.
+    messages[boundary - 1] = AIMessage(
+        content="",
+        tool_calls=[{"name": "spending_breakdown", "args": {}, "id": "call_1"}],
+    )
+    messages[boundary] = ToolMessage(content="результат", tool_call_id="call_1")
+
+    result = await compact_node({"messages": messages})
+    kept = result["messages"][2:]  # after RemoveMessage + summary
+
+    # Guard pulled the AIMessage(tool_calls) into the tail, so it leads — not the
+    # orphaned ToolMessage — and the pair is contiguous.
+    assert isinstance(kept[0], AIMessage)
+    assert kept[0].tool_calls
+    assert isinstance(kept[1], ToolMessage)
+    assert len(kept) == keep + 1
 
 
 @pytest.mark.unit

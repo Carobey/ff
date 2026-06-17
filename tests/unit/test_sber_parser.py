@@ -82,12 +82,15 @@ def test_classify_unknown_positive() -> None:
 
 # ── _parse_transactions ──────────────────────────────────────────────────────
 
+# Реальный формат: ДВЕ колонки чисел — сумма операции и остаток средств.
 _SAMPLE_SECTION = """\
 и код авторизации
-      23.05.2026 09:48 Прочие операции                                  27 900,00
+      23.05.2026 09:48 Прочие операции                     27 900,00      457,93
       23.05.2026 224085 SBERBANK ONL@IN KARTA-VKLAD. Операция по карте ****9206
-      23.05.2026 09:47 Перевод СБП                                      +14 000,00
+      23.05.2026 09:47 Перевод СБП                          +14 000,00   28 357,93
       23.05.2026 659634 Перевод от Ц. Юрий Владимирович. Операция по карте ****9206
+      22.05.2026 17:46 Отдых и развлечения                  599,00      14 357,93
+      22.05.2026 372086 IVI.RU MOSCOW RUS. Операция по карте ****9206
 Дата формирования документа 29.05.2026
 """
 
@@ -96,15 +99,25 @@ _SAMPLE_SECTION = """\
 def test_parse_transactions_basic() -> None:
     parser = SberPdfParser()
     rows = parser._parse_transactions(_SAMPLE_SECTION)
-    assert len(rows) == 2
+    assert len(rows) == 3
 
     r0 = rows[0]
     assert r0["date_str"] == "23.05.2026"
     assert r0["time_str"] == "09:48"
     assert r0["sber_category"] == "Прочие операции"
-    assert r0["amount_raw"] == "27 900,00"
+    assert r0["amount_raw"] == "27 900,00"  # сумма операции, НЕ остаток 457,93
     assert "Операция по карте" not in r0["merchant"]
     assert "SBERBANK" in r0["merchant"]
+
+
+@pytest.mark.unit
+def test_parse_transactions_takes_operation_amount_not_balance() -> None:
+    """Регрессия: берём сумму операции (599), а не остаток средств (14 357,93)."""
+    parser = SberPdfParser()
+    rows = parser._parse_transactions(_SAMPLE_SECTION)
+    ivi = next(r for r in rows if "IVI" in r["merchant"])
+    assert ivi["amount_raw"] == "599,00"
+    assert "14 357,93" not in ivi["amount_raw"]
 
 
 @pytest.mark.unit

@@ -9,7 +9,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, TypedDict, TypeGuard
 
-from family_finance.domain import Category, Direction, Transaction
+from family_finance.domain import Category, Direction, Transaction, normalize_merchant
 
 
 class ClarificationQuestion(TypedDict):
@@ -190,23 +190,26 @@ def _questions_by_id(
 
 
 def _group_transactions(transactions: list[Transaction]) -> list[ClarificationGroup]:
+    # Ключ группировки — нормализованный мерчант, иначе «Виталий К.» и «ВИТАЛИЙ К.»
+    # дают два отдельных вопроса об одном получателе в рамках одного импорта (QA-11).
+    # Для отображения берём сырое имя первой операции группы.
     grouped: dict[tuple[str, str], list[Transaction]] = defaultdict(list)
     for tx in transactions:
         reason = _question_reason(tx)
         if reason is None:
             continue
-        grouped[(reason, tx.merchant_raw)].append(tx)
+        grouped[(reason, normalize_merchant(tx.merchant_raw))].append(tx)
 
     result = [
         ClarificationGroup(
             reason=reason,
-            merchant_raw=merchant_raw,
+            merchant_raw=items[0].merchant_raw,
             payment_dates=tuple(sorted({tx.posted_at or tx.occurred_at.date() for tx in items})),
             count=len(items),
             total=sum((tx.amount for tx in items), Decimal("0")),
             import_hashes=tuple(tx.import_hash for tx in items if tx.import_hash is not None),
         )
-        for (reason, merchant_raw), items in grouped.items()
+        for (reason, _merchant_key), items in grouped.items()
     ]
     return sorted(result, key=lambda item: (item.reason, item.merchant_raw))
 

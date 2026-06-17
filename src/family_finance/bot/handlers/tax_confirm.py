@@ -38,8 +38,7 @@ def format_tax_questions(payload: dict[str, Any]) -> str:
     if payload.get("ask_children_education"):
         total = payload.get("education_total")
         lines.append(
-            f"• Из обучения ({total} ₽) сколько за <b>детей</b> и сколько детей? "
-            "Если за себя — 0."
+            f"• Из обучения ({total} ₽) сколько за <b>детей</b> и сколько детей? Если за себя — 0."
         )
         fields.append("обучение детей: 0; число детей: 0")
     lines.append("")

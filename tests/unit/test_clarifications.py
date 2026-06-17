@@ -156,6 +156,33 @@ def test_build_import_questions_groups_similar_transactions() -> None:
 
 
 @pytest.mark.unit
+def test_build_import_questions_groups_merchant_spelling_variants() -> None:
+    """«Виталий К.» и «ВИТАЛИЙ К.» — один получатель, один вопрос (QA-11)."""
+    questions = format_import_questions(
+        build_import_questions(
+            [
+                _tx(
+                    merchant_raw="Виталий К.",
+                    amount="1000",
+                    direction=Direction.TRANSFER,
+                    category=Category.TRANSFER_INTERNAL,
+                    confidence=0.6,
+                ),
+                _tx(
+                    merchant_raw="ВИТАЛИЙ К.",
+                    amount="500",
+                    direction=Direction.TRANSFER,
+                    category=Category.TRANSFER_INTERNAL,
+                    confidence=0.6,
+                ),
+            ],
+        )
+    )
+
+    assert questions == ["Перевод: «Виталий К.», 01.04.2026, 2 операций на 1500.00 ₽. Что это?"]
+
+
+@pytest.mark.unit
 def test_parse_clarification_answers_ignores_unknown_labels() -> None:
     transaction = _tx(
         merchant_raw="Unknown",

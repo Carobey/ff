@@ -39,6 +39,16 @@ def test_week_window_from_midweek() -> None:
 
 
 @pytest.mark.unit
+def test_week_window_from_monday_targets_just_ended_week() -> None:
+    """A Monday run must summarise the week that just ended, not jump forward (QA-12)."""
+    now = datetime(2026, 6, 15, 9, 0, tzinfo=_MOSCOW)  # Monday
+    start, end = _week_window(now)
+    assert end == datetime(2026, 6, 15, 0, 0, tzinfo=_MOSCOW)
+    assert start == datetime(2026, 6, 8, 0, 0, tzinfo=_MOSCOW)
+    assert (end - start).days == 7
+
+
+@pytest.mark.unit
 async def test_build_digest_returns_none_when_no_spending() -> None:
     family_id = uuid.uuid4()
     with patch(

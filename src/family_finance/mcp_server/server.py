@@ -55,6 +55,7 @@ async def query_aggregates(
     start: str | None = None,
     end: str | None = None,
     limit: int = 100,
+    merchant_query: str | None = None,
 ) -> list[dict[str, object]]:
     """Flexible grouped sums — the main spending-query tool.
 
@@ -71,7 +72,9 @@ async def query_aggregates(
 
     ``categories``/``directions`` are domain enum values (e.g. ``food.groceries``,
     ``expense``); omit or pass ``[]`` for "all". ``start``/``end`` are ISO-8601
-    datetimes; omit for all-time. Returns a list of
+    datetimes; omit for all-time. ``merchant_query`` scopes the result to one
+    merchant by a normalized substring match (e.g. ``"ivi ru"`` for «расходы на
+    IVI.RU») — omit for all merchants. Returns a list of
     ``{"bucket", "subbucket", "total", "count"}`` where ``bucket`` is the group
     key as a string (date, ``YYYY-MM``, category value or merchant name) and
     ``subbucket`` is ``None`` unless ``then_by`` is set.
@@ -85,6 +88,7 @@ async def query_aggregates(
         start=_parse_dt(start),
         end=_parse_dt(end),
         limit=limit,
+        merchant_query=merchant_query,
     )
     return [
         {"bucket": b.bucket, "subbucket": b.subbucket, "total": str(b.total), "count": b.count}
@@ -101,13 +105,15 @@ async def list_transactions(
     end: str | None = None,
     order_by: Literal["date_desc", "amount_desc"] = "date_desc",
     limit: int = 20,
+    merchant_query: str | None = None,
 ) -> list[dict[str, object]]:
     """List individual transactions (not aggregated).
 
     Use for «покажи списком», «топ-5 крупных трат». ``order_by`` is
     ``date_desc`` (newest first) or ``amount_desc`` (biggest first). Filters and
-    period behave like ``query_aggregates``. Returns a list of
-    ``{"occurred_at", "amount", "direction", "category", "merchant"}``.
+    period behave like ``query_aggregates``. ``merchant_query`` scopes the list to
+    one merchant by a normalized substring match (e.g. ``"ivi ru"``). Returns a
+    list of ``{"occurred_at", "amount", "direction", "category", "merchant"}``.
     """
     rows = await _repo().list_transactions(
         family_id=uuid.UUID(family_id),
@@ -117,6 +123,7 @@ async def list_transactions(
         end=_parse_dt(end),
         order_by=order_by,
         limit=limit,
+        merchant_query=merchant_query,
     )
     return [
         {

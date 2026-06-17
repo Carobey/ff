@@ -1,0 +1,13 @@
+id: coach_002
+agent: coach
+description: "«Как часто я заказываю доставку» — ответ содержит количество из инструмента"
+tags: [coach, behavioral, grounding]
+input:
+  text: "Как часто я заказывал доставку еды в мае?"
+expected:
+  # Конкретный токен (число операций) проставляет раннер из засеянной истории.
+  kind: delivery_count
+scorers:
+  - type: contains_any
+    field: answer
+  - type: llm_judge

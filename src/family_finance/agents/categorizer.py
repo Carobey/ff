@@ -74,8 +74,8 @@ CATEGORIZER_SYSTEM_HEADER = """\
 
 ПРАВИЛА:
 - confidence 0.9+ только при полной уверенности (известный магазин, очевидный тип)
-- confidence 0.7-0.9 если категория вероятна, но название не на 100% однозначно
-- confidence < 0.7 если продавец непонятен или подходит несколько категорий —
+- confidence 0.75-0.9 если категория вероятна, но название не на 100% однозначно
+- confidence < 0.75 если продавец непонятен или подходит несколько категорий —
   такие операции уйдут на ручную проверку (needs_review)
 - confidence < 0.5 если невозможно определить → используй unclassified
 - Для переводов между своими картами — всегда transfer.internal
@@ -113,19 +113,29 @@ async def categorizer_node(state: FinanceState) -> dict[str, Any]:
     family_id = uuid.UUID(state["family_id"])
     all_transactions: list[Transaction] = list(state.get("parsed_transactions") or [])
 
-    to_classify = _select_for_llm(all_transactions, all_=settings.llm_categorize_all)
+    # Шаг 1 (правила) идёт по ВСЕМ не-TRANSFER строкам: справочник-правило
+    # авторитетнее даже уверенной категории парсера (enrichment-first — личность
+    # мерчанта перебивает грубую категорию банка). Иначе IVI, уверенно помеченный
+    # парсером как «развлечения», никогда не переклассифицируется в «подписки».
+    rule_candidates = [tx for tx in all_transactions if tx.direction != Direction.TRANSFER]
+    # В LLM (шаг 2) уходят только реально неуверенные строки — бюджет не раздуваем.
+    uncertain = _select_for_llm(all_transactions, all_=settings.llm_categorize_all)
+    uncertain_keys = {tx.import_hash or str(tx.transaction_id) for tx in uncertain}
 
     rule_enriched: dict[str, Transaction] = {}
     llm_enriched: dict[str, Transaction] = {}
-    if to_classify:
-        # Шаг 1: правила-справочник (без LLM).
-        rule_enriched, llm_remaining = await _resolve_by_rules(
-            to_classify,
+    if rule_candidates:
+        # Шаг 1: правила-справочник (без LLM) — по всем не-переводам.
+        rule_enriched, rule_misses = await _resolve_by_rules(
+            rule_candidates,
             family_id=family_id,
             rule_repo=PostgresMerchantRuleRepository(),
             threshold=settings.merchant_match_threshold,
         )
-        # Шаг 2: всё, что не узнали по правилам — в LLM.
+        # Шаг 2: из промахов по правилам в LLM берём только неуверенные.
+        llm_remaining = [
+            tx for tx in rule_misses if (tx.import_hash or str(tx.transaction_id)) in uncertain_keys
+        ]
         if llm_remaining:
             taxonomy = await _load_taxonomy()
             llm_enriched = await _run_llm_batch(
@@ -146,16 +156,15 @@ async def categorizer_node(state: FinanceState) -> dict[str, Any]:
     # (~4 LLM calls), not per row, keeps bulk imports cheap (see ingest_node).
     _write_import_episode(family_id, merged)
 
-    # Production-скор для дашборда: доля операций, ушедших на ручную проверку
-    # среди тех, что мы пытались классифицировать (rule + LLM).
-    if to_classify:
-        attempted_keys = {tx.import_hash or str(tx.transaction_id) for tx in to_classify}
+    # Production-скор для дашборда: доля изначально неуверенных операций,
+    # оставшихся на ручную проверку после каскада (правила снижают её).
+    if uncertain:
         by_key = {tx.import_hash or str(tx.transaction_id): tx for tx in merged}
-        reviewed = sum(1 for k in attempted_keys if by_key[k].needs_review)
+        reviewed = sum(1 for k in uncertain_keys if by_key[k].needs_review)
         emit_score(
             "categorization_review_rate",
-            reviewed / len(to_classify),
-            comment=f"{reviewed}/{len(to_classify)} needs_review",
+            reviewed / len(uncertain),
+            comment=f"{reviewed}/{len(uncertain)} needs_review",
         )
 
     # Rebuild clarification questions from post-cascade state
@@ -241,6 +250,17 @@ _CATEGORIZER_CONCURRENCY = 10  # max parallel LLM calls; keeps OpenRouter happy
 # а уверенное эвристическое сопоставление) — оставляем место ручному правилу/правке.
 _RULE_CONFIDENCE = 0.95
 
+# Порог ручной проверки: LLM-догадки ниже этого уходят на подтверждение, а не
+# молча оседают неверной категорией. Поднят с 0.7 — пограничные [0.7, 0.75) теперь
+# честнее идут на ревью.
+_NEEDS_REVIEW_THRESHOLD = 0.75
+
+# Порог, при котором правило-справочник перебивает УЖЕ уверенную категорию (не
+# UNCLASSIFIED, не needs_review). Нечёткого 0.6 мало: «Яндекс Заправки» (топливо)
+# на 0.64 ложно матчится на «яндекс еда» и слетает в доставку. Перебивать уверенную
+# категорию можно только near-exact совпадением; неуверенные строки — обычный порог.
+_RULE_OVERRIDE_THRESHOLD = 0.9
+
 
 async def _load_taxonomy() -> str:
     """Подтянуть таксономию из справочника; при ошибке — пустая строка (fallback)."""
@@ -279,6 +299,12 @@ async def _resolve_by_rules(
     for tx in transactions:
         hit = hits.get(tx.merchant_raw)
         if hit is None:
+            remaining.append(tx)
+            continue
+        # Уверенную категорию перебиваем только near-exact правилом — иначе нечёткий
+        # матч на 0.6 ломает корректные строки. Неуверенные принимают обычный порог.
+        tx_is_confident = tx.category != Category.UNCLASSIFIED and not tx.needs_review
+        if tx_is_confident and hit.score < _RULE_OVERRIDE_THRESHOLD:
             remaining.append(tx)
             continue
         direction = direction_for_category(hit.category)
@@ -332,7 +358,7 @@ async def _categorize_one(
                     "category": prediction.category,
                     "direction": direction_for_category(prediction.category),
                     "confidence": prediction.confidence,
-                    "needs_review": prediction.confidence < 0.7,
+                    "needs_review": prediction.confidence < _NEEDS_REVIEW_THRESHOLD,
                 }
             )
         except Exception:

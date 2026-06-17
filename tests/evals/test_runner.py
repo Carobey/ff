@@ -12,23 +12,28 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import asyncpg
 import pytest
 import yaml
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict
 
+from family_finance.agents._messages import message_text
 from family_finance.agents.categorizer import CategoryPrediction, build_system_prompt
+from family_finance.agents.coach import coach_node
 from family_finance.agents.supervisor import route_after_supervisor, supervisor_node
 from family_finance.domain import Category, Direction, Transaction, TransactionSource
 from family_finance.infrastructure.llm import get_chat_model
 from family_finance.infrastructure.parsers import TinkoffCsvParser
-from family_finance.infrastructure.persistence import PostgresCategoryCatalog
+from family_finance.infrastructure.persistence import (
+    PostgresCategoryCatalog,
+    PostgresTransactionRepository,
+)
 from family_finance.infrastructure.security import check_injection
 from family_finance.infrastructure.settings import get_settings
 from tests.evals.cascade_task import run_cascade
@@ -95,11 +100,48 @@ async def _llm_judge_plan(user_text: str, plan: list[str]) -> float:
     return 1.0 if verdict.reasonable else 0.0
 
 
+class _CoachJudge(BaseModel):
+    """Verdict of the LLM-judge on whether a coach answer is grounded."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    grounded: bool
+    reason: str = ""
+
+
+_COACH_JUDGE_SYSTEM = (
+    "Ты — судья качества финансового коуча. Тебе дают поведенческий вопрос "
+    "пользователя о его тратах и ответ коуча. Верни grounded=true, если ответ по "
+    "делу отвечает на вопрос конкретными цифрами/датами, а НЕ отговоркой «нет "
+    "данных» и не общими словами; иначе grounded=false."
+)
+
+
+async def _llm_judge_coach(user_text: str, answer: str) -> float:
+    """LLM-as-judge: 1.0 if the coach answer addresses the question with real data."""
+    model = get_chat_model(tier="worker").with_structured_output(_CoachJudge)
+    verdict: _CoachJudge = await model.ainvoke(  # type: ignore[assignment]
+        [
+            SystemMessage(content=_COACH_JUDGE_SYSTEM),
+            HumanMessage(content=f"Вопрос: {user_text}\nОтвет коуча: {answer}"),
+        ],
+    )
+    return 1.0 if verdict.grounded else 0.0
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 EVAL_FAMILY_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 EVAL_MEMBER_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
 CASES_DIR = Path(__file__).parent / "cases"
+
+# Выделенная одноразовая семья для coach-evals (не пересекается с реальными chat-id).
+_COACH_EVAL_TG_ID = 999_000_222
+# Фиксированная майская история доставок: даты в прошлом и стабильны между
+# прогонами, поэтому детерминированный import_hash держит add_many идемпотентным
+# (count не плывёт). Последняя доставка 27.05.2026 → эта дата должна попасть в
+# ответ «когда последний раз»; число майских доставок (3) → в ответ «как часто».
+_COACH_DELIVERY_DATES = (date(2026, 5, 8), date(2026, 5, 16), date(2026, 5, 27))
 
 
 def _load_cases(agent: str) -> list[Path]:
@@ -375,6 +417,114 @@ async def test_multi_intent(case_path: Path) -> None:
             failures.append(
                 f"scorer={scorer_cfg['type']} field={scorer_cfg.get('field')} "
                 f"got={result} expected={case['expected']}"
+            )
+
+    assert not failures, f"{case['id']}: {'; '.join(failures)}"
+
+
+# ── Coach quality evals (LLM + MCP tools, live DB) ───────────────────────────
+
+
+async def _seed_coach_history() -> uuid.UUID:
+    """Seed a fixed delivery history for the coach-eval family; return family_id.
+
+    Idempotent: deterministic import_hash + add_many ON CONFLICT DO NOTHING.
+    """
+    repo = PostgresTransactionRepository()
+    family_id, member_id = await repo.ensure_member_for_telegram(
+        telegram_user_id=_COACH_EVAL_TG_ID,
+        name="Coach eval family",
+    )
+    txs = [
+        Transaction(
+            family_id=family_id,
+            member_id=member_id,
+            occurred_at=datetime(d.year, d.month, d.day, 10, 0, tzinfo=UTC),
+            amount=Decimal("1100.00"),
+            currency="RUB",  # type: ignore[arg-type]
+            direction=Direction.EXPENSE,
+            merchant_raw="Яндекс Еда",
+            merchant_normalized="Яндекс Еда",
+            category=Category.FOOD_DELIVERY,
+            confidence=0.95,
+            source=TransactionSource.BANK_CSV,
+            import_hash=f"coach-eval:delivery:{d.isoformat()}",
+        )
+        for d in _COACH_DELIVERY_DATES
+    ]
+    # Трата позже последней доставки — чтобы «последний раз ДОСТАВКУ» требовал
+    # фильтра по продавцу, а не просто «последняя трата».
+    txs.append(
+        Transaction(
+            family_id=family_id,
+            member_id=member_id,
+            occurred_at=datetime(2026, 5, 30, 10, 0, tzinfo=UTC),
+            amount=Decimal("4200.00"),
+            currency="RUB",  # type: ignore[arg-type]
+            direction=Direction.EXPENSE,
+            merchant_raw="Пятёрочка",
+            merchant_normalized="Пятёрочка",
+            category=Category.FOOD_GROCERIES,
+            confidence=0.95,
+            source=TransactionSource.BANK_CSV,
+            import_hash="coach-eval:grocery:2026-05-30",
+        )
+    )
+    await repo.add_many(txs)
+    return family_id
+
+
+def _coach_expected_tokens(kind: str) -> list[str]:
+    """Acceptable substrings for the tool-derived number/date, by case kind."""
+    if kind == "last_delivery_date":
+        last = _COACH_DELIVERY_DATES[-1]
+        return [f"{last.day:02d}.{last.month:02d}", f"{last.day} мая"]
+    if kind == "delivery_count":
+        return [str(len(_COACH_DELIVERY_DATES))]
+    raise ValueError(f"Unknown coach expected kind: {kind!r}")
+
+
+@pytest.mark.eval
+@pytest.mark.parametrize(
+    "case_path",
+    _load_cases("coach"),
+    ids=lambda p: p.stem,
+)
+async def test_coach_quality(case_path: Path) -> None:
+    """Coach answer QUALITY: a behavioural question must be answered with a
+    number/date that came from the MCP tools (grounding), not hallucinated.
+
+    Seeds a fixed delivery history for a throwaway family, runs the real ReAct
+    coach (LLM + MCP tools, live DB) and asserts the answer echoes the
+    tool-derived token. Skips when Postgres is unavailable.
+    """
+    await _skip_if_postgres_unavailable()
+
+    text = await asyncio.to_thread(case_path.read_text)
+    case: dict[str, Any] = yaml.safe_load(text)
+
+    family_id = await _seed_coach_history()
+    state: dict[str, Any] = {
+        "family_id": str(family_id),
+        "messages": [HumanMessage(content=case["input"]["text"])],
+    }
+    update = await coach_node(state)
+    answer = message_text(cast("BaseMessage", update["messages"][-1]))  # type: ignore[index]
+    result: dict[str, Any] = {"answer": answer}
+
+    expected = dict(case["expected"])
+    expected["answer"] = _coach_expected_tokens(expected["kind"])
+
+    failures: list[str] = []
+    for scorer_cfg in case["scorers"]:
+        if scorer_cfg["type"] == "llm_judge":
+            score = await _llm_judge_coach(case["input"]["text"], answer)
+        else:
+            score = apply_scorer(scorer_cfg, result, expected)
+        if score < 1.0:
+            failures.append(
+                f"scorer={scorer_cfg['type']} field={scorer_cfg.get('field')} "
+                f"got={answer!r} expected≈{expected.get('answer')}"
             )
 
     assert not failures, f"{case['id']}: {'; '.join(failures)}"
