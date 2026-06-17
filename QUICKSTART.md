@@ -134,7 +134,7 @@ nano .env
 
 ```bash
 # от BotFather:
-TELEGRAM_BOT_TOKEN=7234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw
+TELEGRAM_BOT_TOKEN=45345345345:dfgdfhfgjgfhjdgfhfdshsfghjf
 
 # твой ID от @userinfobot, без пробелов вокруг запятых:
 TELEGRAM_ALLOWED_USER_IDS=123456789
